@@ -60,6 +60,7 @@ import "C"
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -243,7 +244,17 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 }
 
 // hostLog forwards a log line to CPA's logger through the host callback.
+// CPA prints only the message, not the fields, so they are inlined as well.
 func hostLog(level, message string, fields map[string]any) {
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v, _ := json.Marshal(fields[k])
+		message += " " + k + "=" + string(v)
+	}
 	payload, err := json.Marshal(map[string]any{"level": level, "message": message, "fields": fields})
 	if err != nil {
 		return

@@ -99,6 +99,7 @@ type balancer struct {
 	dirty     bool
 	loaded    bool
 	polling   bool
+	stopped   bool
 	stop      chan struct{}
 }
 
@@ -145,13 +146,18 @@ func (b *balancer) configure(cfg config) {
 	})
 }
 
+// shutdown runs once. CPA invokes it twice on exit (the plugin.shutdown RPC
+// and then the C shutdown hook); the second call must not touch the host.
 func (b *balancer) shutdown() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.stopped {
+		return
+	}
+	b.stopped = true
 	if b.polling {
 		b.polling = false
 		close(b.stop)
-		b.stop = make(chan struct{})
 	}
 	if err := b.saveLocked(); err != nil {
 		b.log("warn", "cpa-balancer: state save failed", map[string]any{"error": err.Error()})
@@ -413,6 +419,8 @@ func (b *balancer) newest(provider string, observations ...quotaObservation) (qu
 }
 
 func (b *balancer) pollLoop() {
+	// The plugin is loaded before CPA's HTTP listener is up.
+	time.Sleep(3 * time.Second)
 	for {
 		b.mu.Lock()
 		interval := time.Duration(b.cfg.PollSeconds) * time.Second
