@@ -27,9 +27,14 @@ type config struct {
 	ManagementURL string            `yaml:"management_url"`
 	ManagementKey string            `yaml:"management_key"`
 	StateFile     string            `yaml:"state_file"`
+	Probe         *bool             `yaml:"probe"`
+	// ProbeStaleMinutes is how old an observation may be before the account is
+	// probed directly. Accounts with traffic never get this old.
+	ProbeStaleMinutes int `yaml:"probe_stale_minutes"`
 }
 
 func (c config) shadow() bool { return c.Shadow == nil || *c.Shadow }
+func (c config) probe() bool  { return c.Probe == nil || *c.Probe }
 
 func (c config) withDefaults() config {
 	if c.K <= 0 {
@@ -40,6 +45,9 @@ func (c config) withDefaults() config {
 	}
 	if c.PollSeconds <= 0 {
 		c.PollSeconds = 30
+	}
+	if c.ProbeStaleMinutes <= 0 {
+		c.ProbeStaleMinutes = 60
 	}
 	if c.ManagementURL == "" {
 		c.ManagementURL = "http://127.0.0.1:8317"
@@ -60,12 +68,14 @@ func (c config) withDefaults() config {
 }
 
 type account struct {
-	ID       string `json:"id"`
-	Provider string `json:"provider"`
-	Label    string `json:"label,omitempty"`
-	Priority int    `json:"priority"`
-	Disabled bool   `json:"disabled,omitempty"`
-	Quota    quota  `json:"quota"`
+	ID        string `json:"id"`
+	AuthIndex string `json:"auth_index,omitempty"`
+	Provider  string `json:"provider"`
+	Label     string `json:"label,omitempty"`
+	Priority  int    `json:"priority"`
+	Disabled  bool   `json:"disabled,omitempty"`
+	Quota     quota  `json:"quota"`
+	lastProbe time.Time
 }
 
 type binding struct {
@@ -97,6 +107,8 @@ type balancer struct {
 	rng       *rand.Rand
 	now       func() time.Time
 	log       func(level, msg string, fields map[string]any)
+	authJSON  func(authIndex string) ([]byte, error) // host.auth.get; nil disables probing
+	http      *http.Client
 	dirty     bool
 	loaded    bool
 	polling   bool
@@ -113,6 +125,7 @@ func newBalancer(logf func(level, msg string, fields map[string]any)) *balancer 
 		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 		now:      time.Now,
 		log:      logf,
+		http:     &http.Client{Timeout: 15 * time.Second},
 		stop:     make(chan struct{}),
 	}
 }
@@ -143,6 +156,7 @@ func (b *balancer) configure(cfg config) {
 	b.log("info", "cpa-balancer configured", map[string]any{
 		"shadow": b.cfg.shadow(), "k": b.cfg.K, "horizon_hours": b.cfg.HorizonHours,
 		"ttl": b.cfg.TTL, "poll_seconds": b.cfg.PollSeconds, "management_poll": b.cfg.ManagementKey != "",
+		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes,
 		"state_file": b.cfg.StateFile, "bindings": len(b.bindings), "accounts": len(b.accounts),
 	})
 }
@@ -384,8 +398,9 @@ func (b *balancer) usage(rec pluginapi.UsageRecord) {
 
 type authFilesResponse struct {
 	Files []struct {
-		ID       string `json:"id"`
-		Provider string `json:"provider"`
+		ID        string `json:"id"`
+		AuthIndex string `json:"auth_index"`
+		Provider  string `json:"provider"`
 		Type     string `json:"type"`
 		Email    string `json:"email"`
 		Label    string `json:"label"`
@@ -431,6 +446,7 @@ func (b *balancer) pollLoop() {
 		if err := b.poll(); err != nil {
 			b.log("warn", "cpa-balancer: poll failed", map[string]any{"error": err.Error()})
 		}
+		b.probeStale()
 		b.mu.Lock()
 		if b.dirty {
 			if err := b.saveLocked(); err != nil {
@@ -486,6 +502,9 @@ func (b *balancer) poll() error {
 			b.accounts[f.ID] = a
 		}
 		a.Provider, a.Priority, a.Disabled = provider, f.Priority, f.Disabled
+		if f.AuthIndex != "" {
+			a.AuthIndex = f.AuthIndex
+		}
 		if f.Email != "" {
 			a.Label = f.Email
 		} else if f.Label != "" {
@@ -501,6 +520,27 @@ func (b *balancer) poll() error {
 	}
 	b.dirty = true
 	return nil
+}
+
+// probeStale pulls usage directly for accounts nothing has observed recently.
+func (b *balancer) probeStale() {
+	now := b.now()
+	b.mu.Lock()
+	due := b.probeDueLocked(now)
+	b.mu.Unlock()
+	for _, t := range due {
+		q, err := b.probe(t, now)
+		b.mu.Lock()
+		a := b.accounts[t.authID]
+		if err != nil {
+			b.log("warn", "cpa-balancer: probe failed", map[string]any{"auth": b.labelLocked(t.authID), "provider": t.provider, "error": err.Error()})
+		} else if a != nil && !q.ObservedAt.Before(a.Quota.ObservedAt) {
+			a.Quota = q
+			b.dirty = true
+			b.log("info", "cpa-balancer probed", map[string]any{"auth": b.labelLocked(t.authID), "provider": t.provider, "remaining": q.LongRemaining, "reset": q.LongResetAt.UTC().Format(time.RFC3339), "short_util": q.ShortUtil})
+		}
+		b.mu.Unlock()
+	}
 }
 
 // --- persistence -------------------------------------------------------------
@@ -585,6 +625,7 @@ func (b *balancer) state() stateView {
 	v := stateView{Config: map[string]any{
 		"shadow": b.cfg.shadow(), "k": b.cfg.K, "horizon_hours": b.cfg.HorizonHours,
 		"ttl": b.cfg.TTL, "poll_seconds": b.cfg.PollSeconds, "management_poll": b.cfg.ManagementKey != "", "state_file": b.cfg.StateFile,
+		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes,
 	}}
 	for _, a := range b.accounts {
 		av := accountView{account: *a}

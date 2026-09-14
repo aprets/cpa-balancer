@@ -4,7 +4,11 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -297,4 +301,91 @@ func TestStateRoundtrip(t *testing.T) {
 	if c.bindings[bindingKey("claude", "ancient")] != nil {
 		t.Fatal("bindings idle for more than twice the TTL are pruned on save")
 	}
+}
+
+const codexUsageBody = `{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":30,"limit_window_seconds":604800,"reset_after_seconds":391847,"reset_at":1789805965},"secondary_window":null},"additional_rate_limits":[{"limit_name":"GPT-5.3-Codex-Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":1789432119}}}],"rate_limit_reset_credits":{"available_count":3}}`
+
+const claudeUsageBody = `{"five_hour":{"utilization":44.0,"resets_at":"2026-09-14T19:30:00.657566+00:00"},"seven_day":{"utilization":11.0,"resets_at":"2026-09-16T07:00:00.657585+00:00"},"seven_day_oauth_apps":null,"seven_day_opus":{"utilization":20.0,"resets_at":"2026-09-16T07:00:00.657585+00:00"},"nimbus_quill":{"utilization":0.0,"resets_at":null},"extra_usage":{"is_enabled":false,"utilization":null}}`
+
+func TestParseCodexUsage(t *testing.T) {
+	q, err := parseCodexUsage([]byte(codexUsageBody), t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(q.LongRemaining-0.7) > 1e-9 || q.LongResetAt.Unix() != 1789805965 || q.ShortUtil != 0 {
+		t.Fatalf("got %+v", q)
+	}
+	if _, err := parseCodexUsage([]byte(`{"plan_type":"pro"}`), t0); err == nil {
+		t.Fatal("missing rate_limit must error")
+	}
+}
+
+func TestParseClaudeUsage(t *testing.T) {
+	q, err := parseClaudeUsage([]byte(claudeUsageBody), t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// seven_day_opus (20%) is worse than seven_day (11%), so remaining is 0.8.
+	if math.Abs(q.LongRemaining-0.8) > 1e-9 || math.Abs(q.ShortUtil-0.44) > 1e-9 {
+		t.Fatalf("got %+v", q)
+	}
+	if q.LongResetAt.UTC().Format(time.RFC3339) != "2026-09-16T07:00:00Z" {
+		t.Fatalf("reset = %v", q.LongResetAt)
+	}
+	if _, err := parseClaudeUsage([]byte(`{"five_hour":{"utilization":1}}`), t0); err == nil {
+		t.Fatal("missing seven_day must error")
+	}
+}
+
+func TestProbeStaleAccountsThroughStubbedUpstream(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		if r.Header.Get("Authorization") != "Bearer tok" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if strings.Contains(r.URL.Path, "wham") {
+			_, _ = w.Write([]byte(codexUsageBody))
+			return
+		}
+		_, _ = w.Write([]byte(claudeUsageBody))
+	}))
+	defer srv.Close()
+	b := newTestBalancer(t)
+	b.authJSON = func(index string) ([]byte, error) { return []byte(`{"access_token":"tok","account_id":"acc"}`), nil }
+	b.http = &http.Client{Transport: rewriteTo(srv.URL)}
+	b.accounts["cx"] = &account{ID: "cx", AuthIndex: "1", Provider: "codex"}
+	b.accounts["cl"] = &account{ID: "cl", AuthIndex: "2", Provider: "claude"}
+	b.accounts["fresh"] = &account{ID: "fresh", AuthIndex: "3", Provider: "claude", Quota: quota{Known: true, ObservedAt: t0.Add(-time.Minute)}}
+	b.accounts["off"] = &account{ID: "off", AuthIndex: "4", Provider: "claude", Disabled: true}
+
+	b.probeStale()
+	if hits != 2 {
+		t.Fatalf("expected 2 probes (unknown codex + unknown claude), got %d", hits)
+	}
+	if q := b.accounts["cx"].Quota; !q.Known || math.Abs(q.LongRemaining-0.7) > 1e-9 {
+		t.Fatalf("codex not probed: %+v", q)
+	}
+	if q := b.accounts["cl"].Quota; !q.Known || math.Abs(q.LongRemaining-0.8) > 1e-9 {
+		t.Fatalf("claude not probed: %+v", q)
+	}
+	b.probeStale()
+	if hits != 2 {
+		t.Fatal("known and fresh accounts must not be re-probed")
+	}
+	b.now = func() time.Time { return t0.Add(2 * time.Hour) }
+	b.probeStale()
+	if hits != 5 {
+		t.Fatalf("all three enabled accounts are stale after two hours and must be re-probed, got %d hits", hits)
+	}
+}
+
+// rewriteTo sends every request to the test server regardless of host.
+type rewriteTo string
+
+func (r rewriteTo) RoundTrip(req *http.Request) (*http.Response, error) {
+	u, _ := url.Parse(string(r))
+	req.URL.Scheme, req.URL.Host = u.Scheme, u.Host
+	return http.DefaultTransport.RoundTrip(req)
 }

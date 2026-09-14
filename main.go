@@ -59,6 +59,7 @@ import "C"
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 	"unsafe"
@@ -72,6 +73,8 @@ const pluginName = "cpa-balancer"
 const pluginVersion = "0.1.0"
 
 var bal = newBalancer(hostLog)
+
+func init() { bal.authJSON = hostAuthJSON }
 
 func main() {}
 
@@ -216,6 +219,8 @@ var configFields = []pluginapi.ConfigField{
 	{Name: "management_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA base URL for the management API. Default http://127.0.0.1:8317."},
 	{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "Management API key. Without it only response headers feed quota."},
 	{Name: "state_file", Type: pluginapi.ConfigFieldTypeString, Description: "Where bindings and quota snapshot persist across restarts."},
+	{Name: "probe", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Pull usage directly from the upstream usage endpoint for accounts with no recent observation. Default true."},
+	{Name: "probe_stale_minutes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Observation age after which an account is probed. Default 60."},
 }
 
 func okEnvelope(v any) ([]byte, error) {
@@ -243,6 +248,55 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	response.len = C.size_t(len(raw))
 }
 
+// hostCall invokes a host callback and returns the result payload.
+func hostCall(method string, payload []byte) ([]byte, error) {
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+	var req *C.uint8_t
+	if len(payload) > 0 {
+		req = (*C.uint8_t)(C.CBytes(payload))
+		defer C.free(unsafe.Pointer(req))
+	}
+	var resp C.cliproxy_buffer
+	rc := C.call_host_api(cMethod, req, C.size_t(len(payload)), &resp)
+	var raw []byte
+	if resp.ptr != nil {
+		raw = C.GoBytes(unsafe.Pointer(resp.ptr), C.int(resp.len))
+		C.free_host_buffer(resp.ptr, resp.len)
+	}
+	if rc != 0 {
+		return nil, fmt.Errorf("host call %s failed (%d): %s", method, int(rc), string(raw))
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("host call %s: bad envelope: %w", method, err)
+	}
+	if !env.OK {
+		msg := "unknown error"
+		if env.Error != nil {
+			msg = env.Error.Code + ": " + env.Error.Message
+		}
+		return nil, fmt.Errorf("host call %s: %s", method, msg)
+	}
+	return env.Result, nil
+}
+
+// hostAuthJSON returns the credential JSON for an auth index via host.auth.get.
+func hostAuthJSON(authIndex string) ([]byte, error) {
+	payload, _ := json.Marshal(map[string]string{"auth_index": authIndex})
+	result, err := hostCall(pluginabi.MethodHostAuthGet, payload)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		JSON json.RawMessage `json:"json"`
+	}
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return nil, err
+	}
+	return resp.JSON, nil
+}
+
 // hostLog forwards a log line to CPA's logger through the host callback.
 // CPA prints only the message, not the fields, so they are inlined as well.
 func hostLog(level, message string, fields map[string]any) {
@@ -259,12 +313,5 @@ func hostLog(level, message string, fields map[string]any) {
 	if err != nil {
 		return
 	}
-	cMethod := C.CString(pluginabi.MethodHostLog)
-	defer C.free(unsafe.Pointer(cMethod))
-	req := (*C.uint8_t)(C.CBytes(payload))
-	defer C.free(unsafe.Pointer(req))
-	var resp C.cliproxy_buffer
-	if C.call_host_api(cMethod, req, C.size_t(len(payload)), &resp) == 0 && resp.ptr != nil {
-		C.free_host_buffer(resp.ptr, resp.len)
-	}
+	_, _ = hostCall(pluginabi.MethodHostLog, payload)
 }

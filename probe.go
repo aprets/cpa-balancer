@@ -1,0 +1,193 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// Probing asks the upstream usage endpoints directly, with the account's own
+// OAuth token, for accounts whose quota is unknown or has gone stale because
+// they have had no traffic. One GET per account, no generation, no fake data.
+
+const (
+	codexUsageURL  = "https://chatgpt.com/backend-api/wham/usage"
+	claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
+	probeMinGap    = 10 * time.Minute // per account, also after failures
+)
+
+type probeTarget struct {
+	authID    string
+	authIndex string
+	provider  string
+}
+
+// probeDue lists enabled accounts whose quota is unknown or older than the
+// staleness window, skipping those probed too recently. Caller holds the lock.
+func (b *balancer) probeDueLocked(now time.Time) []probeTarget {
+	if b.authJSON == nil || !b.cfg.probe() {
+		return nil
+	}
+	stale := time.Duration(b.cfg.ProbeStaleMinutes) * time.Minute
+	var due []probeTarget
+	for _, a := range b.accounts {
+		if a.Disabled || a.AuthIndex == "" || (a.Provider != "codex" && a.Provider != "claude") {
+			continue
+		}
+		if a.Quota.Known && now.Sub(a.Quota.ObservedAt) < stale {
+			continue
+		}
+		if !a.lastProbe.IsZero() && now.Sub(a.lastProbe) < probeMinGap {
+			continue
+		}
+		a.lastProbe = now
+		due = append(due, probeTarget{authID: a.ID, authIndex: a.AuthIndex, provider: a.Provider})
+	}
+	return due
+}
+
+// probe fetches one account's usage. Called without the lock.
+func (b *balancer) probe(t probeTarget, now time.Time) (quota, error) {
+	raw, err := b.authJSON(t.authIndex)
+	if err != nil {
+		return quota{}, fmt.Errorf("auth json: %w", err)
+	}
+	var auth struct {
+		AccessToken string `json:"access_token"`
+		AccountID   string `json:"account_id"`
+	}
+	if err := json.Unmarshal(raw, &auth); err != nil || auth.AccessToken == "" {
+		return quota{}, errors.New("no access token in auth json")
+	}
+	var req *http.Request
+	switch t.provider {
+	case "codex":
+		req, _ = http.NewRequest(http.MethodGet, codexUsageURL, nil)
+		req.Header.Set("User-Agent", "codex_cli_rs/0.120.0")
+		if auth.AccountID != "" {
+			req.Header.Set("chatgpt-account-id", auth.AccountID)
+		}
+	case "claude":
+		req, _ = http.NewRequest(http.MethodGet, claudeUsageURL, nil)
+		req.Header.Set("User-Agent", "claude-cli/2.1.267 (external, cli)")
+		req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	default:
+		return quota{}, fmt.Errorf("no probe for provider %q", t.provider)
+	}
+	req.Header.Set("Authorization", "Bearer "+auth.AccessToken)
+	req.Header.Set("Accept", "application/json")
+	resp, err := b.http.Do(req)
+	if err != nil {
+		return quota{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return quota{}, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return quota{}, fmt.Errorf("usage endpoint returned %d", resp.StatusCode)
+	}
+	switch t.provider {
+	case "codex":
+		return parseCodexUsage(body, now)
+	default:
+		return parseClaudeUsage(body, now)
+	}
+}
+
+func parseCodexUsage(body []byte, now time.Time) (quota, error) {
+	type window struct {
+		UsedPercent        float64 `json:"used_percent"`
+		LimitWindowSeconds int64   `json:"limit_window_seconds"`
+		ResetAt            int64   `json:"reset_at"`
+		ResetAfterSeconds  int64   `json:"reset_after_seconds"`
+	}
+	var resp struct {
+		RateLimit *struct {
+			Primary   *window `json:"primary_window"`
+			Secondary *window `json:"secondary_window"`
+		} `json:"rate_limit"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return quota{}, err
+	}
+	if resp.RateLimit == nil {
+		return quota{}, errors.New("no rate_limit in usage response")
+	}
+	var long, short *window
+	for _, w := range []*window{resp.RateLimit.Primary, resp.RateLimit.Secondary} {
+		if w == nil || w.LimitWindowSeconds <= 0 {
+			continue
+		}
+		if long == nil || w.LimitWindowSeconds > long.LimitWindowSeconds {
+			if long != nil {
+				short = long
+			}
+			long = w
+		} else {
+			short = w
+		}
+	}
+	if long == nil {
+		return quota{}, errors.New("no usable window in usage response")
+	}
+	q := quota{Known: true, LongRemaining: clamp01(1 - long.UsedPercent/100), ObservedAt: now}
+	if long.ResetAt > 0 {
+		q.LongResetAt = time.Unix(long.ResetAt, 0)
+	} else if long.ResetAfterSeconds > 0 {
+		q.LongResetAt = now.Add(time.Duration(long.ResetAfterSeconds) * time.Second)
+	}
+	if short != nil {
+		q.ShortUtil = clamp01(short.UsedPercent / 100)
+	}
+	return q, nil
+}
+
+func parseClaudeUsage(body []byte, now time.Time) (quota, error) {
+	type bucket struct {
+		Utilization *float64 `json:"utilization"`
+		ResetsAt    string   `json:"resets_at"`
+	}
+	var resp map[string]json.RawMessage
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return quota{}, err
+	}
+	get := func(key string) (bucket, bool) {
+		raw, ok := resp[key]
+		if !ok || string(raw) == "null" {
+			return bucket{}, false
+		}
+		var b bucket
+		if err := json.Unmarshal(raw, &b); err != nil || b.Utilization == nil {
+			return bucket{}, false
+		}
+		return b, true
+	}
+	weekly, ok := get("seven_day")
+	if !ok {
+		return quota{}, errors.New("no seven_day in usage response")
+	}
+	util := *weekly.Utilization
+	// Model-specific weekly buckets (seven_day_opus etc.) bind before the
+	// shared one when they exist; the worse of them is what we can spend.
+	for key := range resp {
+		if strings.HasPrefix(key, "seven_day_") {
+			if b, ok := get(key); ok && *b.Utilization > util {
+				util = *b.Utilization
+			}
+		}
+	}
+	q := quota{Known: true, LongRemaining: clamp01(1 - util/100), ObservedAt: now}
+	if t, err := time.Parse(time.RFC3339Nano, weekly.ResetsAt); err == nil {
+		q.LongResetAt = t
+	}
+	if five, ok := get("five_hour"); ok {
+		q.ShortUtil = clamp01(*five.Utilization / 100)
+	}
+	return q, nil
+}

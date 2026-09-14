@@ -60,11 +60,17 @@ fails. We want something small we fully understand.
      invented reset dates.
 
    There are no thresholds anywhere. Weights just get small.
-3. **Quota from real traffic.** CPA already parses `x-codex-*` and
-   `anthropic-ratelimit-unified-*` headers from every response, including
-   Codex WebSocket rate-limit events, into per-auth `quota.signals`. The
-   plugin reads those from the management auth list every `poll_seconds` and
-   also from the response headers on each usage record. No probing.
+3. **Quota from real traffic, with a direct pull as backstop.** CPA already
+   parses `x-codex-*` and `anthropic-ratelimit-unified-*` headers from every
+   response, including Codex WebSocket rate-limit events, into per-auth
+   `quota.signals`. The plugin reads those from the management auth list
+   every `poll_seconds` and from the response headers on each usage record.
+   An account nothing has observed for `probe_stale_minutes` (default 60),
+   including one that has never had traffic, gets one GET to the upstream
+   usage endpoint with its own OAuth token (`chatgpt.com/backend-api/wham/usage`,
+   `api.anthropic.com/api/oauth/usage`). Tokens come from `host.auth.get` so
+   they are always the refreshed ones. No generation requests, no invented
+   data: a failed probe leaves the account unknown.
 4. **Shadow mode.** With `shadow: true` the plugin computes every decision,
    logs it with the full weight table, records what CPA actually did from
    the usage record, and returns "not handled" so native routing stays in
@@ -72,7 +78,8 @@ fails. We want something small we fully understand.
    Run this first for a few days, then flip `shadow: false`.
 5. **State survives restarts.** Bindings and the last quota snapshot are
    written to `state_file` on the mounted volume. CPA's own signal store is
-   in memory and the container updates nightly.
+   in memory and the container updates nightly. Between the file and the
+   probe, there is no blind window after a restart.
 6. **Inspection, not a dashboard.** `GET /v0/management/cpa-balancer/state`
    returns config, accounts with current weights, bindings and recent
    decisions. Use curl.
@@ -110,3 +117,4 @@ fails. We want something small we fully understand.
 | `horizon_hours` | 6 | typical session lifetime; measure from logs |
 | `k` | 1 | preference; tune from shadow weight tables |
 | `poll_seconds` | 30 | signal freshness vs management API load |
+| `probe_stale_minutes` | 60 | idle accounts get one direct usage pull per hour |
