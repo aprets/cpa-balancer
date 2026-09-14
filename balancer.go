@@ -1,0 +1,594 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"math/rand"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+type config struct {
+	Shadow        *bool             `yaml:"shadow"`
+	K             float64           `yaml:"k"`
+	HorizonHours  float64           `yaml:"horizon_hours"`
+	TTL           map[string]string `yaml:"ttl"`
+	PollSeconds   int               `yaml:"poll_seconds"`
+	ManagementURL string            `yaml:"management_url"`
+	ManagementKey string            `yaml:"management_key"`
+	StateFile     string            `yaml:"state_file"`
+}
+
+func (c config) shadow() bool { return c.Shadow == nil || *c.Shadow }
+
+func (c config) withDefaults() config {
+	if c.K <= 0 {
+		c.K = 1
+	}
+	if c.HorizonHours <= 0 {
+		c.HorizonHours = 6
+	}
+	if c.PollSeconds <= 0 {
+		c.PollSeconds = 30
+	}
+	if c.ManagementURL == "" {
+		c.ManagementURL = "http://127.0.0.1:8317"
+	}
+	if c.StateFile == "" {
+		c.StateFile = "plugins/cpa-balancer.state.json"
+	}
+	if c.TTL == nil {
+		c.TTL = map[string]string{}
+	}
+	if _, ok := c.TTL["codex"]; !ok {
+		c.TTL["codex"] = "24h"
+	}
+	if _, ok := c.TTL["claude"]; !ok {
+		c.TTL["claude"] = "1h"
+	}
+	return c
+}
+
+type account struct {
+	ID       string `json:"id"`
+	Provider string `json:"provider"`
+	Label    string `json:"label,omitempty"`
+	Priority int    `json:"priority"`
+	Disabled bool   `json:"disabled,omitempty"`
+	Quota    quota  `json:"quota"`
+}
+
+type binding struct {
+	AuthID   string    `json:"auth_id"`
+	LastSeen time.Time `json:"last_seen"`
+}
+
+type decision struct {
+	At       time.Time          `json:"at"`
+	Provider string             `json:"provider"`
+	Session  string             `json:"session"`
+	Kind     string             `json:"kind"` // sticky, fork, new, none
+	AuthID   string             `json:"auth_id"`
+	Weights  map[string]float64 `json:"weights,omitempty"`
+	Shadow   bool               `json:"shadow"`
+	Actual   string             `json:"actual,omitempty"` // filled from the usage record
+}
+
+const decisionHistory = 200
+
+type balancer struct {
+	mu        sync.Mutex
+	cfg       config
+	ttl       map[string]time.Duration
+	accounts  map[string]*account
+	bindings  map[string]*binding
+	decisions []decision
+	rng       *rand.Rand
+	now       func() time.Time
+	log       func(level, msg string, fields map[string]any)
+	dirty     bool
+	loaded    bool
+	polling   bool
+	stop      chan struct{}
+}
+
+func newBalancer(logf func(level, msg string, fields map[string]any)) *balancer {
+	return &balancer{
+		cfg:      config{}.withDefaults(),
+		ttl:      map[string]time.Duration{},
+		accounts: map[string]*account{},
+		bindings: map[string]*binding{},
+		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		now:      time.Now,
+		log:      logf,
+		stop:     make(chan struct{}),
+	}
+}
+
+func (b *balancer) configure(cfg config) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.cfg = cfg.withDefaults()
+	b.ttl = map[string]time.Duration{}
+	for provider, raw := range b.cfg.TTL {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			b.log("warn", "cpa-balancer: bad ttl, using 1h", map[string]any{"provider": provider, "value": raw})
+			d = time.Hour
+		}
+		b.ttl[strings.ToLower(provider)] = d
+	}
+	if !b.loaded {
+		b.loaded = true
+		if err := b.loadLocked(); err != nil && !errors.Is(err, os.ErrNotExist) {
+			b.log("warn", "cpa-balancer: state load failed", map[string]any{"error": err.Error()})
+		}
+	}
+	if b.cfg.ManagementKey != "" && !b.polling {
+		b.polling = true
+		go b.pollLoop()
+	}
+	b.log("info", "cpa-balancer configured", map[string]any{
+		"shadow": b.cfg.shadow(), "k": b.cfg.K, "horizon_hours": b.cfg.HorizonHours,
+		"ttl": b.cfg.TTL, "poll_seconds": b.cfg.PollSeconds, "management_poll": b.cfg.ManagementKey != "",
+		"state_file": b.cfg.StateFile, "bindings": len(b.bindings), "accounts": len(b.accounts),
+	})
+}
+
+func (b *balancer) shutdown() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.polling {
+		b.polling = false
+		close(b.stop)
+		b.stop = make(chan struct{})
+	}
+	if err := b.saveLocked(); err != nil {
+		b.log("warn", "cpa-balancer: state save failed", map[string]any{"error": err.Error()})
+	}
+}
+
+func (b *balancer) ttlFor(provider string) time.Duration {
+	if d, ok := b.ttl[strings.ToLower(provider)]; ok {
+		return d
+	}
+	return time.Hour
+}
+
+func bindingKey(provider, session string) string {
+	return strings.ToLower(provider) + "|" + session
+}
+
+func metaString(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	s, _ := m[key].(string)
+	return strings.TrimSpace(s)
+}
+
+func shortSession(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
+}
+
+// pick is the scheduler hook. It always computes a decision; in shadow mode
+// it reports it and lets CPA's native selector run.
+func (b *balancer) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPickResponse {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	provider := strings.ToLower(strings.TrimSpace(req.Provider))
+	if provider == "" && len(req.Candidates) > 0 {
+		provider = strings.ToLower(req.Candidates[0].Provider)
+	}
+	if len(req.Candidates) == 0 {
+		return pluginapi.SchedulerPickResponse{Handled: false}
+	}
+	offered := make(map[string]bool, len(req.Candidates))
+	for _, c := range req.Candidates {
+		offered[c.ID] = true
+	}
+	session := metaString(req.Options.Metadata, "canonical_session_id")
+	parent := metaString(req.Options.Metadata, "parent_session_id")
+	ttl := b.ttlFor(provider)
+
+	d := decision{At: now, Provider: provider, Session: shortSession(session), Shadow: b.cfg.shadow()}
+	if session != "" {
+		if bd := b.bindings[bindingKey(provider, session)]; bd != nil && now.Sub(bd.LastSeen) <= ttl && offered[bd.AuthID] {
+			d.Kind, d.AuthID = "sticky", bd.AuthID
+		}
+	}
+	if d.AuthID == "" && parent != "" {
+		if bd := b.bindings[bindingKey(provider, parent)]; bd != nil && now.Sub(bd.LastSeen) <= ttl && offered[bd.AuthID] {
+			d.Kind, d.AuthID = "fork", bd.AuthID
+		}
+	}
+	if d.AuthID == "" {
+		d.Weights = b.weightsLocked(req.Candidates, now)
+		d.Kind, d.AuthID = "new", b.weightedPick(d.Weights)
+		if session == "" {
+			d.Kind = "none"
+		}
+	}
+	if !d.Shadow && session != "" {
+		b.bindings[bindingKey(provider, session)] = &binding{AuthID: d.AuthID, LastSeen: now}
+		b.dirty = true
+	}
+	b.recordLocked(d)
+	if d.Shadow {
+		return pluginapi.SchedulerPickResponse{Handled: false}
+	}
+	return pluginapi.SchedulerPickResponse{AuthID: d.AuthID, Handled: true}
+}
+
+func (b *balancer) recordLocked(d decision) {
+	b.decisions = append(b.decisions, d)
+	if len(b.decisions) > decisionHistory {
+		b.decisions = b.decisions[len(b.decisions)-decisionHistory:]
+	}
+	fields := map[string]any{"provider": d.Provider, "session": d.Session, "kind": d.Kind, "auth": b.labelLocked(d.AuthID), "shadow": d.Shadow}
+	if d.Weights != nil {
+		labelled := make(map[string]float64, len(d.Weights))
+		for id, w := range d.Weights {
+			labelled[b.labelLocked(id)] = math.Round(w*1e6) / 1e6
+		}
+		fields["weights"] = labelled
+	}
+	b.log("info", "cpa-balancer decision", fields)
+}
+
+func (b *balancer) labelLocked(id string) string {
+	if a := b.accounts[id]; a != nil && a.Label != "" {
+		return a.Label
+	}
+	return id
+}
+
+// weightsLocked scores every candidate. Unknown quota gets the median of the
+// known weights so it is neither favoured nor starved.
+func (b *balancer) weightsLocked(cands []pluginapi.SchedulerAuthCandidate, now time.Time) map[string]float64 {
+	weights := make(map[string]float64, len(cands))
+	var known []float64
+	var unknown []string
+	for _, c := range cands {
+		a := b.accounts[c.ID]
+		if a == nil || !a.Quota.Known {
+			unknown = append(unknown, c.ID)
+			continue
+		}
+		w := b.weight(a.Quota, now)
+		weights[c.ID] = w
+		known = append(known, w)
+	}
+	fill := 1.0
+	if len(known) > 0 {
+		sort.Float64s(known)
+		fill = known[len(known)/2]
+		if len(known)%2 == 0 {
+			fill = (known[len(known)/2-1] + known[len(known)/2]) / 2
+		}
+	}
+	for _, id := range unknown {
+		weights[id] = fill
+	}
+	return weights
+}
+
+// weight implements the formula in DESIGN.md. CPA priority is not part of it:
+// the host only offers the highest-priority tier as candidates, so priority
+// is already a hard override before the plugin runs.
+func (b *balancer) weight(q quota, now time.Time) float64 {
+	remaining := q.LongRemaining
+	hours := 168.0 // reset unknown: assume a full week away
+	if !q.LongResetAt.IsZero() {
+		hours = q.LongResetAt.Sub(now).Hours()
+		if hours < 0 {
+			// The window reset after we last observed it: the account is full
+			// again and we do not yet know the next reset.
+			remaining, hours = 1, 168
+		}
+	}
+	urgency := remaining / (hours + b.cfg.HorizonHours)
+	return math.Pow(urgency, b.cfg.K) * (1 - q.ShortUtil)
+}
+
+func (b *balancer) weightedPick(weights map[string]float64) string {
+	ids := make([]string, 0, len(weights))
+	for id := range weights {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	total := 0.0
+	for _, id := range ids {
+		total += weights[id]
+	}
+	if total <= 0 {
+		return ids[b.rng.Intn(len(ids))]
+	}
+	r := b.rng.Float64() * total
+	for _, id := range ids {
+		r -= weights[id]
+		if r < 0 {
+			return id
+		}
+	}
+	return ids[len(ids)-1]
+}
+
+// usage is the usage hook: it mirrors what CPA actually did onto the binding
+// table, feeds quota from response headers, and closes the loop on the most
+// recent decision for the session.
+func (b *balancer) usage(rec pluginapi.UsageRecord) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	provider := strings.ToLower(strings.TrimSpace(rec.Provider))
+	if rec.AuthID == "" || provider == "" {
+		return
+	}
+	a := b.accounts[rec.AuthID]
+	if a == nil {
+		a = &account{ID: rec.AuthID, Provider: provider}
+		b.accounts[rec.AuthID] = a
+	}
+	if q := parseSignals(provider, headerSignals(rec.ResponseHeaders), now); q.Known && !q.ObservedAt.Before(a.Quota.ObservedAt) {
+		a.Quota = q
+		b.dirty = true
+	}
+	if rec.SessionID == "" {
+		return
+	}
+	key := bindingKey(provider, rec.SessionID)
+	if bd := b.bindings[key]; bd == nil || bd.AuthID != rec.AuthID {
+		b.bindings[key] = &binding{AuthID: rec.AuthID, LastSeen: now}
+	} else {
+		bd.LastSeen = now
+	}
+	b.dirty = true
+	short := shortSession(rec.SessionID)
+	for i := len(b.decisions) - 1; i >= 0; i-- {
+		d := &b.decisions[i]
+		if d.Provider != provider || d.Session != short || d.Actual != "" {
+			continue
+		}
+		d.Actual = rec.AuthID
+		if d.Kind == "new" && d.AuthID != rec.AuthID {
+			b.log("info", "cpa-balancer differs from CPA", map[string]any{"provider": provider, "session": short, "ours": b.labelLocked(d.AuthID), "cpa": b.labelLocked(rec.AuthID), "shadow": d.Shadow})
+		}
+		break
+	}
+}
+
+// --- management API polling -------------------------------------------------
+
+type authFilesResponse struct {
+	Files []struct {
+		ID       string `json:"id"`
+		Provider string `json:"provider"`
+		Type     string `json:"type"`
+		Email    string `json:"email"`
+		Label    string `json:"label"`
+		Priority int    `json:"priority"`
+		Disabled bool   `json:"disabled"`
+		Quota       quotaObservation            `json:"quota"`
+		ModelQuotas map[string]quotaObservation `json:"model_quotas"`
+	} `json:"files"`
+}
+
+type quotaObservation struct {
+	ObservedAt string            `json:"observed_at"`
+	Signals    map[string]string `json:"signals"`
+}
+
+// newest parses every observation CPA retains for the account (auth-level and
+// per-model) and returns the most recent usable one.
+func (b *balancer) newest(provider string, observations ...quotaObservation) (quota, bool) {
+	var best quota
+	for _, o := range observations {
+		if len(o.Signals) == 0 {
+			continue
+		}
+		observed, _ := time.Parse(time.RFC3339Nano, o.ObservedAt)
+		if observed.IsZero() {
+			observed = b.now()
+		}
+		if q := parseSignals(provider, o.Signals, observed); q.Known && (!best.Known || q.ObservedAt.After(best.ObservedAt)) {
+			best = q
+		}
+	}
+	return best, best.Known
+}
+
+func (b *balancer) pollLoop() {
+	for {
+		b.mu.Lock()
+		interval := time.Duration(b.cfg.PollSeconds) * time.Second
+		stop := b.stop
+		b.mu.Unlock()
+		if err := b.poll(); err != nil {
+			b.log("warn", "cpa-balancer: poll failed", map[string]any{"error": err.Error()})
+		}
+		b.mu.Lock()
+		if b.dirty {
+			if err := b.saveLocked(); err != nil {
+				b.log("warn", "cpa-balancer: state save failed", map[string]any{"error": err.Error()})
+			}
+		}
+		b.mu.Unlock()
+		select {
+		case <-stop:
+			return
+		case <-time.After(interval):
+		}
+	}
+}
+
+func (b *balancer) poll() error {
+	b.mu.Lock()
+	url := strings.TrimRight(b.cfg.ManagementURL, "/") + "/v0/management/auth-files"
+	key := b.cfg.ManagementKey
+	b.mu.Unlock()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("auth-files returned %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return err
+	}
+	var parsed authFilesResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, f := range parsed.Files {
+		provider := strings.ToLower(f.Provider)
+		if provider == "" {
+			provider = strings.ToLower(f.Type)
+		}
+		a := b.accounts[f.ID]
+		if a == nil {
+			a = &account{ID: f.ID, Provider: provider}
+			b.accounts[f.ID] = a
+		}
+		a.Provider, a.Priority, a.Disabled = provider, f.Priority, f.Disabled
+		if f.Email != "" {
+			a.Label = f.Email
+		} else if f.Label != "" {
+			a.Label = f.Label
+		}
+		observations := []quotaObservation{f.Quota}
+		for _, o := range f.ModelQuotas {
+			observations = append(observations, o)
+		}
+		if q, ok := b.newest(provider, observations...); ok && !q.ObservedAt.Before(a.Quota.ObservedAt) {
+			a.Quota = q
+		}
+	}
+	b.dirty = true
+	return nil
+}
+
+// --- persistence -------------------------------------------------------------
+
+type persisted struct {
+	SavedAt  time.Time           `json:"saved_at"`
+	Accounts map[string]*account `json:"accounts"`
+	Bindings map[string]*binding `json:"bindings"`
+}
+
+func (b *balancer) saveLocked() error {
+	tmp := b.cfg.StateFile + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(b.cfg.StateFile), 0o755); err != nil {
+		return err
+	}
+	// Drop bindings that expired long ago so the file does not grow forever.
+	now := b.now()
+	for key, bd := range b.bindings {
+		provider, _, _ := strings.Cut(key, "|")
+		if now.Sub(bd.LastSeen) > 2*b.ttlFor(provider) {
+			delete(b.bindings, key)
+		}
+	}
+	raw, err := json.Marshal(persisted{SavedAt: now, Accounts: b.accounts, Bindings: b.bindings})
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, b.cfg.StateFile); err != nil {
+		return err
+	}
+	b.dirty = false
+	return nil
+}
+
+func (b *balancer) loadLocked() error {
+	raw, err := os.ReadFile(b.cfg.StateFile)
+	if err != nil {
+		return err
+	}
+	var p persisted
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return err
+	}
+	if p.Accounts != nil {
+		b.accounts = p.Accounts
+	}
+	if p.Bindings != nil {
+		b.bindings = p.Bindings
+	}
+	return nil
+}
+
+// --- inspection --------------------------------------------------------------
+
+type stateView struct {
+	Config    map[string]any     `json:"config"`
+	Accounts  []accountView      `json:"accounts"`
+	Bindings  []bindingView      `json:"bindings"`
+	Decisions []decision         `json:"decisions"`
+}
+
+type accountView struct {
+	account
+	Weight float64 `json:"weight"`
+}
+
+type bindingView struct {
+	Key     string    `json:"key"`
+	AuthID  string    `json:"auth_id"`
+	Label   string    `json:"label"`
+	Seen    time.Time `json:"last_seen"`
+	Expired bool      `json:"expired"`
+}
+
+func (b *balancer) state() stateView {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	v := stateView{Config: map[string]any{
+		"shadow": b.cfg.shadow(), "k": b.cfg.K, "horizon_hours": b.cfg.HorizonHours,
+		"ttl": b.cfg.TTL, "poll_seconds": b.cfg.PollSeconds, "management_poll": b.cfg.ManagementKey != "", "state_file": b.cfg.StateFile,
+	}}
+	for _, a := range b.accounts {
+		av := accountView{account: *a}
+		if a.Quota.Known && !a.Disabled {
+			av.Weight = b.weight(a.Quota, now)
+		}
+		v.Accounts = append(v.Accounts, av)
+	}
+	sort.Slice(v.Accounts, func(i, j int) bool { return v.Accounts[i].ID < v.Accounts[j].ID })
+	for key, bd := range b.bindings {
+		provider, _, _ := strings.Cut(key, "|")
+		v.Bindings = append(v.Bindings, bindingView{Key: key, AuthID: bd.AuthID, Label: b.labelLocked(bd.AuthID), Seen: bd.LastSeen, Expired: now.Sub(bd.LastSeen) > b.ttlFor(provider)})
+	}
+	sort.Slice(v.Bindings, func(i, j int) bool { return v.Bindings[i].Seen.After(v.Bindings[j].Seen) })
+	v.Decisions = append([]decision(nil), b.decisions...)
+	return v
+}
