@@ -261,6 +261,19 @@ func TestNewestObservationAcrossModels(t *testing.T) {
 	}
 }
 
+func TestUsageMatchesDecisionByFullSessionID(t *testing.T) {
+	b := newTestBalancer(t)
+	b.configure(config{StateFile: b.cfg.StateFile})
+	// UUIDv7-style ids sharing a long prefix and differing only at the tail.
+	b.pick(pickReq("codex", "codex:01a0a1b2-aaaa-4000-8000-000000000001", "", cands("a", "b")))
+	b.pick(pickReq("codex", "codex:01a0a1b2-aaaa-4000-8000-000000000002", "", cands("a", "b")))
+	b.usage(pluginapi.UsageRecord{Provider: "codex", AuthID: "a", SessionID: "codex:01a0a1b2-aaaa-4000-8000-000000000001"})
+	first, second := b.decisions[len(b.decisions)-2], b.decisions[len(b.decisions)-1]
+	if first.Actual != "a" || second.Actual != "" {
+		t.Fatalf("usage must close only its own session's decision: first=%q second=%q", first.Actual, second.Actual)
+	}
+}
+
 func TestStateRoundtrip(t *testing.T) {
 	b := newTestBalancer(t)
 	b.accounts["a"] = &account{ID: "a", Provider: "codex", Label: "a@x", Quota: parseSignals("codex", codexSignals, t0)}

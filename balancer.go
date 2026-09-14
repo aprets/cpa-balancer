@@ -74,9 +74,10 @@ type binding struct {
 }
 
 type decision struct {
-	At       time.Time          `json:"at"`
-	Provider string             `json:"provider"`
-	Session  string             `json:"session"`
+	At        time.Time          `json:"at"`
+	Provider  string             `json:"provider"`
+	SessionID string             `json:"session_id"`
+	Session   string             `json:"session"` // display form: the distinctive tail of the id
 	Kind     string             `json:"kind"` // sticky, fork, new, none
 	AuthID   string             `json:"auth_id"`
 	Weights  map[string]float64 `json:"weights,omitempty"`
@@ -183,9 +184,11 @@ func metaString(m map[string]any, key string) string {
 	return strings.TrimSpace(s)
 }
 
+// shortSession keeps the tail of a session id. Codex ids are UUIDv7, so the
+// head is a timestamp shared by every session started in the same hour.
 func shortSession(s string) string {
-	if len(s) > 12 {
-		return s[:12]
+	if len(s) > 10 {
+		return "…" + s[len(s)-10:]
 	}
 	return s
 }
@@ -211,7 +214,7 @@ func (b *balancer) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerP
 	parent := metaString(req.Options.Metadata, "parent_session_id")
 	ttl := b.ttlFor(provider)
 
-	d := decision{At: now, Provider: provider, Session: shortSession(session), Shadow: b.cfg.shadow()}
+	d := decision{At: now, Provider: provider, SessionID: session, Session: shortSession(session), Shadow: b.cfg.shadow()}
 	if session != "" {
 		if bd := b.bindings[bindingKey(provider, session)]; bd != nil && now.Sub(bd.LastSeen) <= ttl && offered[bd.AuthID] {
 			d.Kind, d.AuthID = "sticky", bd.AuthID
@@ -364,15 +367,14 @@ func (b *balancer) usage(rec pluginapi.UsageRecord) {
 		bd.LastSeen = now
 	}
 	b.dirty = true
-	short := shortSession(rec.SessionID)
 	for i := len(b.decisions) - 1; i >= 0; i-- {
 		d := &b.decisions[i]
-		if d.Provider != provider || d.Session != short || d.Actual != "" {
+		if d.Provider != provider || d.SessionID != rec.SessionID || d.Actual != "" {
 			continue
 		}
 		d.Actual = rec.AuthID
 		if d.Kind == "new" && d.AuthID != rec.AuthID {
-			b.log("info", "cpa-balancer differs from CPA", map[string]any{"provider": provider, "session": short, "ours": b.labelLocked(d.AuthID), "cpa": b.labelLocked(rec.AuthID), "shadow": d.Shadow})
+			b.log("info", "cpa-balancer differs from CPA", map[string]any{"provider": provider, "session": d.Session, "ours": b.labelLocked(d.AuthID), "cpa": b.labelLocked(rec.AuthID), "shadow": d.Shadow})
 		}
 		break
 	}
