@@ -52,9 +52,9 @@ fails. We want something small we fully understand.
      is to prevent a forced move (account exhausted before its reset), so it
      is small where a forced move is cheap (Claude, 1h of cache: 2) and
      larger where it is expensive (Codex, reasoning for a 24h binding: 6).
-   - `k` (default 4) is how hard we lean toward the urgent account. 1 is
-     proportional, higher approaches always-pick-the-max, 0 is uniform. One
-     number for every provider; the provider differences live in `horizon`.
+   - `k` is how hard we lean toward the urgent account. 1 is proportional,
+     higher approaches always-pick-the-max. It is a constant, 4, not config:
+     the simulation picked it and the provider differences live in `horizon`.
      See "How k and horizon were chosen".
    - `headroom` fades an account out of contention as its short window
      (Claude 5h) fills, continuously. Codex Pro has only a weekly window, so
@@ -131,7 +131,7 @@ fails. We want something small we fully understand.
 | `ttl.claude` | 1h | prompt cache lifetime |
 | `horizon_hours.claude` | 2 | cost of a forced move is one hour of cache |
 | `horizon_hours.codex` | 6 | cost of a forced move is reasoning for the binding |
-| `k` | 4 | simulation below: best reserve without exhaustion events. Codex accounts reset together so k barely matters there; watch it if they drift apart |
+| `k` (constant) | 4 | simulation below: best reserve without exhaustion events. Codex accounts reset together so k barely matters there; watch it if they drift apart |
 | `probe_stale_minutes` | 60 | idle accounts get one direct usage pull per hour |
 
 ## How k and horizon were chosen (2026-09-15)

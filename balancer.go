@@ -18,7 +18,6 @@ import (
 
 type config struct {
 	Shadow       *bool              `yaml:"shadow"`
-	K            float64            `yaml:"k"`
 	HorizonHours map[string]float64 `yaml:"horizon_hours"` // per provider
 	TTL          map[string]string  `yaml:"ttl"`
 	StateFile    string             `yaml:"state_file"`
@@ -55,9 +54,6 @@ func (c config) shadow() bool { return c.Shadow == nil || *c.Shadow }
 func (c config) probe() bool  { return c.Probe == nil || *c.Probe }
 
 func (c config) withDefaults() config {
-	if c.K <= 0 {
-		c.K = 4 // lean hard on the soonest reset; see DESIGN.md
-	}
 	// Horizon is where the cost of a forced move lives: an hour of cache on
 	// Claude, reasoning for the rest of a 24h binding on Codex.
 	c.HorizonHours = fill(c.HorizonHours, map[string]float64{"claude": 2, "codex": 6})
@@ -167,7 +163,7 @@ func (b *balancer) configure(cfg config) {
 		go b.loop()
 	}
 	b.log("info", "cpa-balancer configured", map[string]any{
-		"shadow": b.cfg.shadow(), "k": b.cfg.K, "horizon_hours": b.cfg.HorizonHours, "ttl": b.cfg.TTL,
+		"shadow": b.cfg.shadow(), "k": k, "horizon_hours": b.cfg.HorizonHours, "ttl": b.cfg.TTL,
 		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes,
 		"state_file": b.cfg.StateFile, "bindings": len(b.bindings), "accounts": len(b.accounts),
 	})
@@ -322,6 +318,12 @@ func (b *balancer) weightsLocked(cands []pluginapi.SchedulerAuthCandidate, now t
 	return weights
 }
 
+// k is how hard placement leans toward the most urgent account. 1 would be
+// proportional; 4 gets most of always-pick-the-max's reserve without its
+// forced moves. Chosen by simulation, see DESIGN.md. Not configurable on
+// purpose: horizon is the knob that should move, and only per provider.
+const k = 4
+
 // weight implements the formula in DESIGN.md. CPA priority is not part of it:
 // the host only offers the highest-priority tier as candidates, so priority
 // is already a hard override before the plugin runs.
@@ -337,7 +339,7 @@ func (b *balancer) weight(q quota, provider string, now time.Time) float64 {
 		}
 	}
 	urgency := remaining / (hours + b.cfg.horizonFor(provider))
-	return math.Pow(urgency, b.cfg.K) * (1 - q.ShortUtil)
+	return math.Pow(urgency, k) * (1 - q.ShortUtil)
 }
 
 func (b *balancer) weightedPick(weights map[string]float64) string {
@@ -575,7 +577,7 @@ func (b *balancer) state() stateView {
 	defer b.mu.Unlock()
 	now := b.now()
 	v := stateView{Config: map[string]any{
-		"shadow": b.cfg.shadow(), "k": b.cfg.K, "horizon_hours": b.cfg.HorizonHours,
+		"shadow": b.cfg.shadow(), "k": k, "horizon_hours": b.cfg.HorizonHours,
 		"ttl": b.cfg.TTL, "state_file": b.cfg.StateFile,
 		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes,
 	}}

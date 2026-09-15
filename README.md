@@ -30,7 +30,6 @@ plugins:
       enabled: true
       shadow: true                 # log decisions only; flip to false to route
       ttl: { codex: 24h, claude: 1h }
-      k: 4                                   # lean toward the soonest reset
       horizon_hours: { claude: 2, codex: 6 } # how far ahead a placement draws
       state_file: /CLIProxyAPI/plugins/cpa-balancer.state.json
 ```

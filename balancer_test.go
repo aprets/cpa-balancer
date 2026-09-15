@@ -47,9 +47,9 @@ func newTestBalancer(t *testing.T) *balancer {
 	b.now = func() time.Time { return t0 }
 	b.rng = rand.New(rand.NewSource(1))
 	shadow := false
-	// Flat k=1 / horizon 6 so the formula tests read as plain ratios.
+	// Flat horizon 6 so the formula tests read as plain ratios (k is fixed at 4).
 	b.configure(config{Shadow: &shadow, StateFile: filepath.Join(t.TempDir(), "state.json"),
-		K: 1, HorizonHours: map[string]float64{"claude": 6, "codex": 6}})
+		HorizonHours: map[string]float64{"claude": 6, "codex": 6}})
 	return b
 }
 
@@ -97,9 +97,10 @@ func TestWeightPrefersSoonerReset(t *testing.T) {
 	b := newTestBalancer(t)
 	urgent := quota{Known: true, LongRemaining: 0.94, LongResetAt: t0.Add(36 * time.Hour)}
 	relaxed := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(120 * time.Hour)}
+	// Urgency ratio is about 5.6; k=4 raises that to about 1000.
 	ratio := b.weight(urgent, "claude", t0) / b.weight(relaxed, "claude", t0)
-	if ratio < 5 || ratio > 6 {
-		t.Fatalf("ratio = %v, want about 5.6", ratio)
+	if ratio < 900 || ratio > 1100 {
+		t.Fatalf("ratio = %v, want about 1000", ratio)
 	}
 }
 
@@ -116,14 +117,13 @@ func TestHeadroomAndK(t *testing.T) {
 	b := newTestBalancer(t)
 	q := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(24 * time.Hour)}
 	base := b.weight(q, "claude", t0)
+	if math.Abs(base-math.Pow(0.5/30, k)) > 1e-15 {
+		t.Fatalf("weight = %v, want urgency^k", base)
+	}
 	full := q
 	full.ShortUtil = 0.9
 	if math.Abs(b.weight(full, "claude", t0)/base-0.1) > 1e-9 {
 		t.Fatal("90% short-window utilization must scale weight by 0.1")
-	}
-	b.cfg.K = 2
-	if math.Abs(b.weight(q, "claude", t0)-base*base) > 1e-12 {
-		t.Fatal("k=2 must square urgency")
 	}
 }
 
@@ -256,8 +256,8 @@ func TestUsageMirrorsBindingsFeedsQuotaAndClosesLoop(t *testing.T) {
 
 func TestPerProviderDefaults(t *testing.T) {
 	c := config{HorizonHours: map[string]float64{"codex": 3}}.withDefaults()
-	if c.K != 4 || c.horizonFor("claude") != 2 || c.horizonFor("codex") != 3 {
-		t.Fatalf("defaults: k=%v horizon=%v", c.K, c.HorizonHours)
+	if c.horizonFor("claude") != 2 || c.horizonFor("codex") != 3 {
+		t.Fatalf("defaults: horizon=%v", c.HorizonHours)
 	}
 	if c.horizonFor("gemini") != 6 {
 		t.Fatal("unknown provider should fall back to horizon 6")
