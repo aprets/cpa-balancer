@@ -32,7 +32,12 @@ fails. We want something small we fully understand.
      or it already failed this request. Pick fresh and rebind. Never move an
      active binding because another account merely scores better.
 2. **Weighted placement of new sessions.** Each candidate gets a weight and a
-   new session lands on one at random, proportional to weight.
+   new session lands on one at random, proportional to weight. This is
+   weighted random selection, not round-robin: picks are independent, so
+   short runs can streak while the long-run share matches the weights. CPA's
+   native selector is true (with-memory) round-robin and alternates exactly.
+   Smooth weighted round-robin is the drop-in upgrade if shadow data ever
+   shows the short-window spread drifting from the weights.
 
         urgency  = long_remaining_fraction / (hours_until_long_reset + horizon)
         headroom = 1 - short_window_utilization      (1 when no short window)
