@@ -272,11 +272,19 @@ func (b *balancer) recordLocked(d decision) {
 	}
 	fields := map[string]any{"provider": d.Provider, "session": d.Session, "kind": d.Kind, "auth": b.labelLocked(d.AuthID), "shadow": d.Shadow}
 	if d.Weights != nil {
-		labelled := make(map[string]float64, len(d.Weights))
-		for id, w := range d.Weights {
-			labelled[b.labelLocked(id)] = math.Round(w*1e6) / 1e6
+		// Raw weights with k=4 are ~1e-9 and round to zero in a log line;
+		// the share each candidate had of the pick is what a reader wants.
+		var total float64
+		for _, w := range d.Weights {
+			total += w
 		}
-		fields["weights"] = labelled
+		shares := make(map[string]float64, len(d.Weights))
+		for id, w := range d.Weights {
+			if total > 0 {
+				shares[b.labelLocked(id)] = math.Round(w/total*1000) / 10
+			}
+		}
+		fields["share_pct"] = shares
 	}
 	b.log("info", "cpa-balancer decision", fields)
 }
