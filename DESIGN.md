@@ -46,12 +46,15 @@ fails. We want something small we fully understand.
    - `urgency` is the burn rate the account would need to use everything it
      has before its weekly reset. High means allowance is at risk of expiring
      unused, so send work there.
-   - `horizon` (hours, default 6) is the one time constant: roughly how long
-     a session placed now will keep hitting the account. It stops "2% left,
-     resets in an hour" from looking urgent, without a cutoff. Measure real
-     session lifetimes from logs before changing it.
-   - `k` (default 1) is how hard we lean toward the urgent account. 1 is
+   - `horizon` (hours, per provider) is the one time constant: how far ahead
+     a placement made now keeps drawing on the account. It stops "2% left,
+     resets in an hour" from looking urgent, without a cutoff. Its real job
+     is to prevent a forced move (account exhausted before its reset), so it
+     is small where a forced move is cheap (Claude, 1h of cache: 2) and
+     larger where it is expensive (Codex, reasoning for a 24h binding: 6).
+   - `k` (per provider) is how hard we lean toward the urgent account. 1 is
      proportional, higher approaches always-pick-the-max, 0 is uniform.
+     Claude 4, Codex 2. See "How k and horizon were chosen".
    - `headroom` fades an account out of contention as its short window
      (Claude 5h) fills, continuously. Codex Pro has only a weekly window, so
      it is 1 there.
@@ -119,6 +122,45 @@ fails. We want something small we fully understand.
 |---|---|---|
 | `ttl.codex` | 24h | reasoning-loss test, low imbalance cost |
 | `ttl.claude` | 1h | prompt cache lifetime |
-| `horizon_hours` | 6 | typical session lifetime; measure from logs |
-| `k` | 1 | preference; tune from shadow weight tables |
+| `horizon_hours.claude` | 2 | cost of a forced move is one hour of cache |
+| `horizon_hours.codex` | 6 | cost of a forced move is reasoning for the binding |
+| `k.claude` | 4 | simulation below: best reserve without exhaustion events |
+| `k.codex` | 2 | Codex accounts reset together; k barely matters |
 | `probe_stale_minutes` | 60 | idle accounts get one direct usage pull per hour |
+
+## How k and horizon were chosen (2026-09-15)
+
+Data: five days of CPA selector logs (which account served each request),
+7.5 hours of request logs with upstream rate-limit headers, and the OAuth
+usage endpoint for the Claude accounts.
+
+- Claude's binding limit is the model-scoped weekly bucket (`7d_oi` in
+  headers, `weekly_scoped` in the usage endpoint), which ran at about twice
+  the all-models bucket. A heavy Claude Code day costs 25-40 points of it
+  on one account. The 5-hour window peaked at 26% on that day, so the
+  short window is not the constraint at current usage.
+- Weekly Claude demand measured at roughly 50-80% of the pooled capacity. That means exhaustion is unlikely if
+  placement is sane, and the objective is really "keep the most usable
+  reserve for bursts", which is the same as "spend the soonest-resetting
+  quota first".
+- The Codex accounts reset within minutes of each other and ran at similar
+  pace, so Codex placement is close to a coin flip and k there only matters
+  if the resets ever drift apart.
+
+A fluid hourly simulation over three weeks (measured hour-of-day demand
+shape, weekly refills, share per hour proportional to weight^k) was run at
+20, 35, 50 and 80 points/day for today's state, a new-account-joins case,
+and a staggered steady state. Findings:
+
+- Reserve improves monotonically with k and flattens after 3-4. At 35/day
+  in steady state: round-robin 135, k=1 156, k=3 193, k=4 (horizon 2) 207,
+  greedy 216.
+- Greedy (always take the max) is the only policy that produces exhaustion
+  events, i.e. forced moves, at 50/day. k=4 with horizon 2 gets most of
+  greedy's reserve with none of its forced moves at realistic loads.
+- The manual "priority 1 on the soonest-resetting account until it resets"
+  override is roughly equal to k=3 and below k=4 in every scenario. The
+  balancer at k=4 makes the override unnecessary, including when a new
+  account joins with a near reset.
+- Above capacity (80/day) every policy blocks the same amount; placement
+  cannot manufacture quota.

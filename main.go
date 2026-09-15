@@ -213,8 +213,6 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 
 var configFields = []pluginapi.ConfigField{
 	{Name: "shadow", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Log decisions but leave routing to CPA. Default true."},
-	{Name: "k", Type: pluginapi.ConfigFieldTypeNumber, Description: "Exponent on urgency. 1 = proportional, higher leans harder to the soonest reset. Default 1."},
-	{Name: "horizon_hours", Type: pluginapi.ConfigFieldTypeNumber, Description: "Expected session lifetime in hours, added to time-until-reset. Default 6."},
 	{Name: "state_file", Type: pluginapi.ConfigFieldTypeString, Description: "Where bindings and quota snapshot persist across restarts."},
 	{Name: "probe", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Pull usage directly from the upstream usage endpoint for accounts with no recent observation. Default true."},
 	{Name: "probe_stale_minutes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Observation age after which an account is probed. Default 60."},

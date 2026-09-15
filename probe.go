@@ -138,7 +138,7 @@ func parseCodexUsage(body []byte, now time.Time) (quota, error) {
 	}
 	q := quota{Known: true, LongRemaining: clamp01(1 - long.UsedPercent/100), ObservedAt: now}
 	if long.ResetAt > 0 {
-		q.LongResetAt = time.Unix(long.ResetAt, 0)
+		q.LongResetAt = time.Unix(long.ResetAt, 0).UTC()
 	} else if long.ResetAfterSeconds > 0 {
 		q.LongResetAt = now.Add(time.Duration(long.ResetAfterSeconds) * time.Second)
 	}
@@ -184,10 +184,33 @@ func parseClaudeUsage(body []byte, now time.Time) (quota, error) {
 	}
 	q := quota{Known: true, LongRemaining: clamp01(1 - util/100), ObservedAt: now}
 	if t, err := time.Parse(time.RFC3339Nano, weekly.ResetsAt); err == nil {
-		q.LongResetAt = t
+		q.LongResetAt = t.UTC()
 	}
 	if five, ok := get("five_hour"); ok {
 		q.ShortUtil = clamp01(*five.Utilization / 100)
+	}
+	// limits[] carries the model-scoped weekly limit (weekly_scoped, e.g. the
+	// Fable bucket) which is what actually binds and what the response header
+	// 7d_oi reports. It is not in any seven_day_* key, so read it here.
+	if raw, ok := resp["limits"]; ok {
+		var limits []struct {
+			Group   string  `json:"group"`
+			Percent float64 `json:"percent"`
+		}
+		if json.Unmarshal(raw, &limits) == nil {
+			for _, l := range limits {
+				switch l.Group {
+				case "weekly":
+					if l.Percent/100 > 1-q.LongRemaining {
+						q.LongRemaining = clamp01(1 - l.Percent/100)
+					}
+				case "session":
+					if l.Percent/100 > q.ShortUtil {
+						q.ShortUtil = clamp01(l.Percent / 100)
+					}
+				}
+			}
+		}
 	}
 	return q, nil
 }

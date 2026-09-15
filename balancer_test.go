@@ -47,7 +47,9 @@ func newTestBalancer(t *testing.T) *balancer {
 	b.now = func() time.Time { return t0 }
 	b.rng = rand.New(rand.NewSource(1))
 	shadow := false
-	b.configure(config{Shadow: &shadow, StateFile: filepath.Join(t.TempDir(), "state.json")})
+	// Flat k=1 / horizon 6 so the formula tests read as plain ratios.
+	b.configure(config{Shadow: &shadow, StateFile: filepath.Join(t.TempDir(), "state.json"),
+		K: map[string]float64{"claude": 1, "codex": 1}, HorizonHours: map[string]float64{"claude": 6, "codex": 6}})
 	return b
 }
 
@@ -95,7 +97,7 @@ func TestWeightPrefersSoonerReset(t *testing.T) {
 	b := newTestBalancer(t)
 	urgent := quota{Known: true, LongRemaining: 0.94, LongResetAt: t0.Add(36 * time.Hour)}
 	relaxed := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(120 * time.Hour)}
-	ratio := b.weight(urgent, t0) / b.weight(relaxed, t0)
+	ratio := b.weight(urgent, "claude", t0) / b.weight(relaxed, "claude", t0)
 	if ratio < 5 || ratio > 6 {
 		t.Fatalf("ratio = %v, want about 5.6", ratio)
 	}
@@ -105,7 +107,7 @@ func TestHorizonDefusesNearlyEmptyAccount(t *testing.T) {
 	b := newTestBalancer(t)
 	trap := quota{Known: true, LongRemaining: 0.02, LongResetAt: t0.Add(time.Hour)}
 	healthy := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(24 * time.Hour)}
-	if b.weight(trap, t0) >= b.weight(healthy, t0) {
+	if b.weight(trap, "claude", t0) >= b.weight(healthy, "claude", t0) {
 		t.Fatal("2% left resetting in an hour must not beat 50% left resetting tomorrow")
 	}
 }
@@ -113,14 +115,14 @@ func TestHorizonDefusesNearlyEmptyAccount(t *testing.T) {
 func TestHeadroomAndK(t *testing.T) {
 	b := newTestBalancer(t)
 	q := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(24 * time.Hour)}
-	base := b.weight(q, t0)
+	base := b.weight(q, "claude", t0)
 	full := q
 	full.ShortUtil = 0.9
-	if math.Abs(b.weight(full, t0)/base-0.1) > 1e-9 {
+	if math.Abs(b.weight(full, "claude", t0)/base-0.1) > 1e-9 {
 		t.Fatal("90% short-window utilization must scale weight by 0.1")
 	}
-	b.cfg.K = 2
-	if math.Abs(b.weight(q, t0)-base*base) > 1e-12 {
+	b.cfg.K["claude"] = 2
+	if math.Abs(b.weight(q, "claude", t0)-base*base) > 1e-12 {
 		t.Fatal("k=2 must square urgency")
 	}
 }
@@ -129,7 +131,7 @@ func TestResetInThePastMeansFull(t *testing.T) {
 	b := newTestBalancer(t)
 	stale := quota{Known: true, LongRemaining: 0.01, LongResetAt: t0.Add(-time.Hour)}
 	fresh := quota{Known: true, LongRemaining: 1, LongResetAt: t0.Add(168 * time.Hour)}
-	if math.Abs(b.weight(stale, t0)-b.weight(fresh, t0)) > 1e-12 {
+	if math.Abs(b.weight(stale, "claude", t0)-b.weight(fresh, "claude", t0)) > 1e-12 {
 		t.Fatal("an account whose reset has passed counts as full")
 	}
 }
@@ -252,6 +254,22 @@ func TestUsageMirrorsBindingsFeedsQuotaAndClosesLoop(t *testing.T) {
 	}
 }
 
+func TestPerProviderDefaults(t *testing.T) {
+	c := config{K: map[string]float64{"codex": 3}}.withDefaults()
+	if c.kFor("claude") != 4 || c.horizonFor("claude") != 2 || c.kFor("codex") != 3 || c.horizonFor("codex") != 6 {
+		t.Fatalf("defaults: k=%v horizon=%v", c.K, c.HorizonHours)
+	}
+	if c.kFor("gemini") != 2 || c.horizonFor("gemini") != 6 {
+		t.Fatal("unknown provider should fall back to moderate settings")
+	}
+	b := newTestBalancer(t)
+	b.cfg = config{}.withDefaults()
+	q := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(10 * time.Hour)}
+	if math.Abs(b.weight(q, "claude", t0)-math.Pow(0.5/12, 4)) > 1e-12 || math.Abs(b.weight(q, "codex", t0)-math.Pow(0.5/16, 2)) > 1e-12 {
+		t.Fatal("weight must use the provider's own k and horizon")
+	}
+}
+
 func TestRefreshAccountsFromHostAuthList(t *testing.T) {
 	b := newTestBalancer(t)
 	b.accounts["a"] = &account{ID: "a", Provider: "claude", Label: "old", Quota: quota{Known: true, LongRemaining: 0.5}}
@@ -321,7 +339,9 @@ func TestStateRoundtrip(t *testing.T) {
 
 const codexUsageBody = `{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":30,"limit_window_seconds":604800,"reset_after_seconds":391847,"reset_at":1789805965},"secondary_window":null},"additional_rate_limits":[{"limit_name":"GPT-5.3-Codex-Spark","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":1789432119}}}],"rate_limit_reset_credits":{"available_count":3}}`
 
-const claudeUsageBody = `{"five_hour":{"utilization":44.0,"resets_at":"2026-09-14T19:30:00.657566+00:00"},"seven_day":{"utilization":11.0,"resets_at":"2026-09-16T07:00:00.657585+00:00"},"seven_day_oauth_apps":null,"seven_day_opus":{"utilization":20.0,"resets_at":"2026-09-16T07:00:00.657585+00:00"},"nimbus_quill":{"utilization":0.0,"resets_at":null},"extra_usage":{"is_enabled":false,"utilization":null}}`
+// Shape of api.anthropic.com/api/oauth/usage on 2026-09-15. The Fable-scoped
+// weekly limit (42%) lives only in limits[] and binds before seven_day (11%).
+const claudeUsageBody = `{"five_hour":{"utilization":44.0,"resets_at":"2026-09-14T19:30:00.657566+00:00"},"seven_day":{"utilization":11.0,"resets_at":"2026-09-16T07:00:00.657585+00:00"},"seven_day_oauth_apps":null,"seven_day_opus":{"utilization":20.0,"resets_at":"2026-09-16T07:00:00.657585+00:00"},"nimbus_quill":{"utilization":0.0,"resets_at":null},"extra_usage":{"is_enabled":false,"utilization":null},"limits":[{"kind":"session","group":"session","percent":44,"severity":"normal","is_active":false},{"kind":"weekly_all","group":"weekly","percent":11,"severity":"normal","is_active":false},{"kind":"weekly_scoped","group":"weekly","percent":42,"severity":"normal","scope":{"model":{"display_name":"Fable"}},"is_active":true}]}`
 
 func TestParseCodexUsage(t *testing.T) {
 	q, err := parseCodexUsage([]byte(codexUsageBody), t0)
@@ -341,8 +361,9 @@ func TestParseClaudeUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// seven_day_opus (20%) is worse than seven_day (11%), so remaining is 0.8.
-	if math.Abs(q.LongRemaining-0.8) > 1e-9 || math.Abs(q.ShortUtil-0.44) > 1e-9 {
+	// weekly_scoped (42%) in limits[] is worse than seven_day (11%) and
+	// seven_day_opus (20%), so remaining is 0.58.
+	if math.Abs(q.LongRemaining-0.58) > 1e-9 || math.Abs(q.ShortUtil-0.44) > 1e-9 {
 		t.Fatalf("got %+v", q)
 	}
 	if q.LongResetAt.UTC().Format(time.RFC3339) != "2026-09-16T07:00:00Z" {
@@ -383,7 +404,7 @@ func TestProbeStaleAccountsThroughStubbedUpstream(t *testing.T) {
 	if q := b.accounts["cx"].Quota; !q.Known || math.Abs(q.LongRemaining-0.7) > 1e-9 {
 		t.Fatalf("codex not probed: %+v", q)
 	}
-	if q := b.accounts["cl"].Quota; !q.Known || math.Abs(q.LongRemaining-0.8) > 1e-9 {
+	if q := b.accounts["cl"].Quota; !q.Known || math.Abs(q.LongRemaining-0.58) > 1e-9 {
 		t.Fatalf("claude not probed: %+v", q)
 	}
 	b.probeStale()

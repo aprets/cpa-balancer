@@ -52,7 +52,7 @@ func parseCodex(sig map[string]string, observed time.Time) quota {
 		used, _ := strconv.ParseFloat(sig[prefix+"used-percent"], 64)
 		var reset time.Time
 		if unix, _ := strconv.ParseInt(sig[prefix+"reset-at"], 10, 64); unix > 0 {
-			reset = time.Unix(unix, 0)
+			reset = time.Unix(unix, 0).UTC()
 		}
 		windows = append(windows, window{minutes: minutes, used: used / 100, reset: reset})
 	}
@@ -89,7 +89,7 @@ func parseClaude(sig map[string]string, observed time.Time) quota {
 	}
 	q := quota{Known: true, LongRemaining: clamp01(1 - util), ObservedAt: observed}
 	if unix, _ := strconv.ParseInt(sig[p+"7d-reset"], 10, 64); unix > 0 {
-		q.LongResetAt = time.Unix(unix, 0)
+		q.LongResetAt = time.Unix(unix, 0).UTC()
 	}
 	short, _ := strconv.ParseFloat(sig[p+"5h-utilization"], 64)
 	q.ShortUtil = clamp01(short)

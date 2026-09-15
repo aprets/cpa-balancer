@@ -17,27 +17,56 @@ import (
 )
 
 type config struct {
-	Shadow       *bool             `yaml:"shadow"`
-	K            float64           `yaml:"k"`
-	HorizonHours float64           `yaml:"horizon_hours"`
-	TTL          map[string]string `yaml:"ttl"`
-	StateFile    string            `yaml:"state_file"`
-	Probe        *bool             `yaml:"probe"`
+	Shadow       *bool              `yaml:"shadow"`
+	K            map[string]float64 `yaml:"k"`             // per provider; see DESIGN.md
+	HorizonHours map[string]float64 `yaml:"horizon_hours"` // per provider
+	TTL          map[string]string  `yaml:"ttl"`
+	StateFile    string             `yaml:"state_file"`
+	Probe        *bool              `yaml:"probe"`
 	// ProbeStaleMinutes is how old an observation may be before the account is
 	// probed directly. Accounts with traffic never get this old.
 	ProbeStaleMinutes int `yaml:"probe_stale_minutes"`
+}
+
+// fill copies defaults for providers the config leaves unset or non-positive.
+func fill(m, defaults map[string]float64) map[string]float64 {
+	out := map[string]float64{}
+	for k, v := range m {
+		if v > 0 {
+			out[strings.ToLower(k)] = v
+		}
+	}
+	for k, v := range defaults {
+		if out[k] <= 0 {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func (c config) kFor(provider string) float64 {
+	if v := c.K[provider]; v > 0 {
+		return v
+	}
+	return 2
+}
+
+func (c config) horizonFor(provider string) float64 {
+	if v := c.HorizonHours[provider]; v > 0 {
+		return v
+	}
+	return 6
 }
 
 func (c config) shadow() bool { return c.Shadow == nil || *c.Shadow }
 func (c config) probe() bool  { return c.Probe == nil || *c.Probe }
 
 func (c config) withDefaults() config {
-	if c.K <= 0 {
-		c.K = 1
-	}
-	if c.HorizonHours <= 0 {
-		c.HorizonHours = 6
-	}
+	// Claude leans hard on the soonest reset: a forced move there costs an
+	// hour of cache. Codex stays moderate: a forced move loses reasoning for
+	// the rest of a 24h binding. Numbers come from the simulation in DESIGN.md.
+	c.K = fill(c.K, map[string]float64{"claude": 4, "codex": 2})
+	c.HorizonHours = fill(c.HorizonHours, map[string]float64{"claude": 2, "codex": 6})
 	if c.ProbeStaleMinutes <= 0 {
 		c.ProbeStaleMinutes = 60
 	}
@@ -281,7 +310,7 @@ func (b *balancer) weightsLocked(cands []pluginapi.SchedulerAuthCandidate, now t
 			unknown = append(unknown, c.ID)
 			continue
 		}
-		w := b.weight(a.Quota, now)
+		w := b.weight(a.Quota, strings.ToLower(c.Provider), now)
 		weights[c.ID] = w
 		known = append(known, w)
 	}
@@ -302,7 +331,7 @@ func (b *balancer) weightsLocked(cands []pluginapi.SchedulerAuthCandidate, now t
 // weight implements the formula in DESIGN.md. CPA priority is not part of it:
 // the host only offers the highest-priority tier as candidates, so priority
 // is already a hard override before the plugin runs.
-func (b *balancer) weight(q quota, now time.Time) float64 {
+func (b *balancer) weight(q quota, provider string, now time.Time) float64 {
 	remaining := q.LongRemaining
 	hours := 168.0 // reset unknown: assume a full week away
 	if !q.LongResetAt.IsZero() {
@@ -313,8 +342,8 @@ func (b *balancer) weight(q quota, now time.Time) float64 {
 			remaining, hours = 1, 168
 		}
 	}
-	urgency := remaining / (hours + b.cfg.HorizonHours)
-	return math.Pow(urgency, b.cfg.K) * (1 - q.ShortUtil)
+	urgency := remaining / (hours + b.cfg.horizonFor(provider))
+	return math.Pow(urgency, b.cfg.kFor(provider)) * (1 - q.ShortUtil)
 }
 
 func (b *balancer) weightedPick(weights map[string]float64) string {
@@ -559,7 +588,7 @@ func (b *balancer) state() stateView {
 	for _, a := range b.accounts {
 		av := accountView{account: *a}
 		if a.Quota.Known && !a.Disabled {
-			av.Weight = b.weight(a.Quota, now)
+			av.Weight = b.weight(a.Quota, a.Provider, now)
 		}
 		v.Accounts = append(v.Accounts, av)
 	}
