@@ -49,7 +49,7 @@ func newTestBalancer(t *testing.T) *balancer {
 	shadow := false
 	// Flat k=1 / horizon 6 so the formula tests read as plain ratios.
 	b.configure(config{Shadow: &shadow, StateFile: filepath.Join(t.TempDir(), "state.json"),
-		K: map[string]float64{"claude": 1, "codex": 1}, HorizonHours: map[string]float64{"claude": 6, "codex": 6}})
+		K: 1, HorizonHours: map[string]float64{"claude": 6, "codex": 6}})
 	return b
 }
 
@@ -121,7 +121,7 @@ func TestHeadroomAndK(t *testing.T) {
 	if math.Abs(b.weight(full, "claude", t0)/base-0.1) > 1e-9 {
 		t.Fatal("90% short-window utilization must scale weight by 0.1")
 	}
-	b.cfg.K["claude"] = 2
+	b.cfg.K = 2
 	if math.Abs(b.weight(q, "claude", t0)-base*base) > 1e-12 {
 		t.Fatal("k=2 must square urgency")
 	}
@@ -255,18 +255,18 @@ func TestUsageMirrorsBindingsFeedsQuotaAndClosesLoop(t *testing.T) {
 }
 
 func TestPerProviderDefaults(t *testing.T) {
-	c := config{K: map[string]float64{"codex": 3}}.withDefaults()
-	if c.kFor("claude") != 4 || c.horizonFor("claude") != 2 || c.kFor("codex") != 3 || c.horizonFor("codex") != 6 {
+	c := config{HorizonHours: map[string]float64{"codex": 3}}.withDefaults()
+	if c.K != 4 || c.horizonFor("claude") != 2 || c.horizonFor("codex") != 3 {
 		t.Fatalf("defaults: k=%v horizon=%v", c.K, c.HorizonHours)
 	}
-	if c.kFor("gemini") != 2 || c.horizonFor("gemini") != 6 {
-		t.Fatal("unknown provider should fall back to moderate settings")
+	if c.horizonFor("gemini") != 6 {
+		t.Fatal("unknown provider should fall back to horizon 6")
 	}
 	b := newTestBalancer(t)
 	b.cfg = config{}.withDefaults()
 	q := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(10 * time.Hour)}
-	if math.Abs(b.weight(q, "claude", t0)-math.Pow(0.5/12, 4)) > 1e-12 || math.Abs(b.weight(q, "codex", t0)-math.Pow(0.5/16, 2)) > 1e-12 {
-		t.Fatal("weight must use the provider's own k and horizon")
+	if math.Abs(b.weight(q, "claude", t0)-math.Pow(0.5/12, 4)) > 1e-12 || math.Abs(b.weight(q, "codex", t0)-math.Pow(0.5/16, 4)) > 1e-12 {
+		t.Fatal("weight must use the provider's own horizon")
 	}
 }
 

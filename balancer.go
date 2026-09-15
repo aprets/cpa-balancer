@@ -18,7 +18,7 @@ import (
 
 type config struct {
 	Shadow       *bool              `yaml:"shadow"`
-	K            map[string]float64 `yaml:"k"`             // per provider; see DESIGN.md
+	K            float64            `yaml:"k"`
 	HorizonHours map[string]float64 `yaml:"horizon_hours"` // per provider
 	TTL          map[string]string  `yaml:"ttl"`
 	StateFile    string             `yaml:"state_file"`
@@ -44,13 +44,6 @@ func fill(m, defaults map[string]float64) map[string]float64 {
 	return out
 }
 
-func (c config) kFor(provider string) float64 {
-	if v := c.K[provider]; v > 0 {
-		return v
-	}
-	return 2
-}
-
 func (c config) horizonFor(provider string) float64 {
 	if v := c.HorizonHours[provider]; v > 0 {
 		return v
@@ -62,10 +55,11 @@ func (c config) shadow() bool { return c.Shadow == nil || *c.Shadow }
 func (c config) probe() bool  { return c.Probe == nil || *c.Probe }
 
 func (c config) withDefaults() config {
-	// Claude leans hard on the soonest reset: a forced move there costs an
-	// hour of cache. Codex stays moderate: a forced move loses reasoning for
-	// the rest of a 24h binding. Numbers come from the simulation in DESIGN.md.
-	c.K = fill(c.K, map[string]float64{"claude": 4, "codex": 2})
+	if c.K <= 0 {
+		c.K = 4 // lean hard on the soonest reset; see DESIGN.md
+	}
+	// Horizon is where the cost of a forced move lives: an hour of cache on
+	// Claude, reasoning for the rest of a 24h binding on Codex.
 	c.HorizonHours = fill(c.HorizonHours, map[string]float64{"claude": 2, "codex": 6})
 	if c.ProbeStaleMinutes <= 0 {
 		c.ProbeStaleMinutes = 60
@@ -343,7 +337,7 @@ func (b *balancer) weight(q quota, provider string, now time.Time) float64 {
 		}
 	}
 	urgency := remaining / (hours + b.cfg.horizonFor(provider))
-	return math.Pow(urgency, b.cfg.kFor(provider)) * (1 - q.ShortUtil)
+	return math.Pow(urgency, b.cfg.K) * (1 - q.ShortUtil)
 }
 
 func (b *balancer) weightedPick(weights map[string]float64) string {

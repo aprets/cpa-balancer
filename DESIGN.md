@@ -52,9 +52,10 @@ fails. We want something small we fully understand.
      is to prevent a forced move (account exhausted before its reset), so it
      is small where a forced move is cheap (Claude, 1h of cache: 2) and
      larger where it is expensive (Codex, reasoning for a 24h binding: 6).
-   - `k` (per provider) is how hard we lean toward the urgent account. 1 is
-     proportional, higher approaches always-pick-the-max, 0 is uniform.
-     Claude 4, Codex 2. See "How k and horizon were chosen".
+   - `k` (default 4) is how hard we lean toward the urgent account. 1 is
+     proportional, higher approaches always-pick-the-max, 0 is uniform. One
+     number for every provider; the provider differences live in `horizon`.
+     See "How k and horizon were chosen".
    - `headroom` fades an account out of contention as its short window
      (Claude 5h) fills, continuously. Codex Pro has only a weekly window, so
      it is 1 there.
@@ -97,7 +98,13 @@ fails. We want something small we fully understand.
 - Banked/credit resets. Revisit later; the failure mode is burning a second
   credit on an ambiguous timeout.
 - Any UI.
-- Per-model routing.
+- Per-model routing. Claude has an all-models weekly bucket and a smaller
+  Fable-scoped one (`7d_oi`); the plugin rates an account by whichever is
+  fuller, which is exactly right for Fable traffic and merely cautious if
+  something else has eaten the overall bucket. It is wrong only for routing
+  non-Fable traffic, which would want the overall bucket alone. The pick call
+  carries the model and the headers carry both buckets, so this is a small
+  change. Build it when non-Fable traffic through the proxy becomes real.
 - Replaying historical requests. CPA request logs are full bodies (~700 KB
   each, 1 GB cap) and rotate within days; Keeper has no quota history.
   Shadow mode on live traffic is cheaper and more honest.
@@ -124,8 +131,7 @@ fails. We want something small we fully understand.
 | `ttl.claude` | 1h | prompt cache lifetime |
 | `horizon_hours.claude` | 2 | cost of a forced move is one hour of cache |
 | `horizon_hours.codex` | 6 | cost of a forced move is reasoning for the binding |
-| `k.claude` | 4 | simulation below: best reserve without exhaustion events |
-| `k.codex` | 2 | Codex accounts reset together; k barely matters |
+| `k` | 4 | simulation below: best reserve without exhaustion events. Codex accounts reset together so k barely matters there; watch it if they drift apart |
 | `probe_stale_minutes` | 60 | idle accounts get one direct usage pull per hour |
 
 ## How k and horizon were chosen (2026-09-15)
