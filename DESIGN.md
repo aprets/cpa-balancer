@@ -60,12 +60,12 @@ fails. We want something small we fully understand.
      invented reset dates.
 
    There are no thresholds anywhere. Weights just get small.
-3. **Quota from real traffic, with a direct pull as backstop.** CPA already
-   parses `x-codex-*` and `anthropic-ratelimit-unified-*` headers from every
-   response, including Codex WebSocket rate-limit events, into per-auth
-   `quota.signals`. The plugin reads those from the management auth list
-   every `poll_seconds` and from the response headers on each usage record.
-   An account nothing has observed for `probe_stale_minutes` (default 60),
+3. **Quota from real traffic, with a direct pull as backstop.** All inference
+   goes through CPA, so every response's `x-codex-*` and
+   `anthropic-ratelimit-unified-*` headers reach the plugin through the usage
+   hook. Nothing is polled: the management API is not used at all, and the
+   host's in-process `host.auth.list` callback is the only source of account
+   identity (id, auth index, label, disabled). An account nothing has observed for `probe_stale_minutes` (default 60),
    including one that has never had traffic, gets one GET to the upstream
    usage endpoint with its own OAuth token (`chatgpt.com/backend-api/wham/usage`,
    `api.anthropic.com/api/oauth/usage`). Tokens come from `host.auth.get` so
@@ -98,7 +98,7 @@ fails. We want something small we fully understand.
 
 - Plugin ID is the filename stem: `plugins/linux/amd64/cpa-balancer.so`.
   Config lives under `plugins.configs.cpa-balancer` in CPA's `config.yaml`
-  (on the volume, not in git, because it carries the management key).
+  (on the volume, not in git). It contains no secrets.
 - A plugin that fails to load is a warning; CPA falls back to native routing.
   Native ABI version is 1 and has never changed. If a CPA update breaks the
   plugin the symptom is "no decisions logged", not an outage.
@@ -116,5 +116,4 @@ fails. We want something small we fully understand.
 | `ttl.claude` | 1h | prompt cache lifetime |
 | `horizon_hours` | 6 | typical session lifetime; measure from logs |
 | `k` | 1 | preference; tune from shadow weight tables |
-| `poll_seconds` | 30 | signal freshness vs management API load |
 | `probe_stale_minutes` | 60 | idle accounts get one direct usage pull per hour |

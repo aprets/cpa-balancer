@@ -3,8 +3,6 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -19,15 +17,12 @@ import (
 )
 
 type config struct {
-	Shadow        *bool             `yaml:"shadow"`
-	K             float64           `yaml:"k"`
-	HorizonHours  float64           `yaml:"horizon_hours"`
-	TTL           map[string]string `yaml:"ttl"`
-	PollSeconds   int               `yaml:"poll_seconds"`
-	ManagementURL string            `yaml:"management_url"`
-	ManagementKey string            `yaml:"management_key"`
-	StateFile     string            `yaml:"state_file"`
-	Probe         *bool             `yaml:"probe"`
+	Shadow       *bool             `yaml:"shadow"`
+	K            float64           `yaml:"k"`
+	HorizonHours float64           `yaml:"horizon_hours"`
+	TTL          map[string]string `yaml:"ttl"`
+	StateFile    string            `yaml:"state_file"`
+	Probe        *bool             `yaml:"probe"`
 	// ProbeStaleMinutes is how old an observation may be before the account is
 	// probed directly. Accounts with traffic never get this old.
 	ProbeStaleMinutes int `yaml:"probe_stale_minutes"`
@@ -43,14 +38,8 @@ func (c config) withDefaults() config {
 	if c.HorizonHours <= 0 {
 		c.HorizonHours = 6
 	}
-	if c.PollSeconds <= 0 {
-		c.PollSeconds = 30
-	}
 	if c.ProbeStaleMinutes <= 0 {
 		c.ProbeStaleMinutes = 60
-	}
-	if c.ManagementURL == "" {
-		c.ManagementURL = "http://127.0.0.1:8317"
 	}
 	if c.StateFile == "" {
 		c.StateFile = "plugins/cpa-balancer.state.json"
@@ -88,11 +77,11 @@ type decision struct {
 	Provider  string             `json:"provider"`
 	SessionID string             `json:"session_id"`
 	Session   string             `json:"session"` // display form: the distinctive tail of the id
-	Kind     string             `json:"kind"` // sticky, fork, new, none
-	AuthID   string             `json:"auth_id"`
-	Weights  map[string]float64 `json:"weights,omitempty"`
-	Shadow   bool               `json:"shadow"`
-	Actual   string             `json:"actual,omitempty"` // filled from the usage record
+	Kind      string             `json:"kind"`    // sticky, fork, new, none
+	AuthID    string             `json:"auth_id"`
+	Weights   map[string]float64 `json:"weights,omitempty"`
+	Shadow    bool               `json:"shadow"`
+	Actual    string             `json:"actual,omitempty"` // filled from the usage record
 }
 
 const decisionHistory = 200
@@ -107,11 +96,12 @@ type balancer struct {
 	rng       *rand.Rand
 	now       func() time.Time
 	log       func(level, msg string, fields map[string]any)
-	authJSON  func(authIndex string) ([]byte, error) // host.auth.get; nil disables probing
+	authJSON  func(authIndex string) ([]byte, error)        // host.auth.get; nil disables probing
+	authList  func() ([]pluginapi.HostAuthFileEntry, error) // host.auth.list; nil in tests
 	http      *http.Client
 	dirty     bool
 	loaded    bool
-	polling   bool
+	running   bool
 	stopped   bool
 	stop      chan struct{}
 }
@@ -149,13 +139,12 @@ func (b *balancer) configure(cfg config) {
 			b.log("warn", "cpa-balancer: state load failed", map[string]any{"error": err.Error()})
 		}
 	}
-	if b.cfg.ManagementKey != "" && !b.polling {
-		b.polling = true
-		go b.pollLoop()
+	if !b.running {
+		b.running = true
+		go b.loop()
 	}
 	b.log("info", "cpa-balancer configured", map[string]any{
-		"shadow": b.cfg.shadow(), "k": b.cfg.K, "horizon_hours": b.cfg.HorizonHours,
-		"ttl": b.cfg.TTL, "poll_seconds": b.cfg.PollSeconds, "management_poll": b.cfg.ManagementKey != "",
+		"shadow": b.cfg.shadow(), "k": b.cfg.K, "horizon_hours": b.cfg.HorizonHours, "ttl": b.cfg.TTL,
 		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes,
 		"state_file": b.cfg.StateFile, "bindings": len(b.bindings), "accounts": len(b.accounts),
 	})
@@ -170,8 +159,8 @@ func (b *balancer) shutdown() {
 		return
 	}
 	b.stopped = true
-	if b.polling {
-		b.polling = false
+	if b.running {
+		b.running = false
 		close(b.stop)
 	}
 	if err := b.saveLocked(); err != nil {
@@ -394,58 +383,17 @@ func (b *balancer) usage(rec pluginapi.UsageRecord) {
 	}
 }
 
-// --- management API polling -------------------------------------------------
+// --- background loop ---------------------------------------------------------
 
-type authFilesResponse struct {
-	Files []struct {
-		ID        string `json:"id"`
-		AuthIndex string `json:"auth_index"`
-		Provider  string `json:"provider"`
-		Type     string `json:"type"`
-		Email    string `json:"email"`
-		Label    string `json:"label"`
-		Priority int    `json:"priority"`
-		Disabled bool   `json:"disabled"`
-		Quota       quotaObservation            `json:"quota"`
-		ModelQuotas map[string]quotaObservation `json:"model_quotas"`
-	} `json:"files"`
-}
-
-type quotaObservation struct {
-	ObservedAt string            `json:"observed_at"`
-	Signals    map[string]string `json:"signals"`
-}
-
-// newest parses every observation CPA retains for the account (auth-level and
-// per-model) and returns the most recent usable one.
-func (b *balancer) newest(provider string, observations ...quotaObservation) (quota, bool) {
-	var best quota
-	for _, o := range observations {
-		if len(o.Signals) == 0 {
-			continue
-		}
-		observed, _ := time.Parse(time.RFC3339Nano, o.ObservedAt)
-		if observed.IsZero() {
-			observed = b.now()
-		}
-		if q := parseSignals(provider, o.Signals, observed); q.Known && (!best.Known || q.ObservedAt.After(best.ObservedAt)) {
-			best = q
-		}
-	}
-	return best, best.Known
-}
-
-func (b *balancer) pollLoop() {
-	// The plugin is loaded before CPA's HTTP listener is up.
-	time.Sleep(3 * time.Second)
+// Every quota signal arrives through the usage hook, because all inference goes
+// through CPA. The loop only does what traffic cannot: learn which accounts
+// exist, probe the ones nothing has touched, and flush state.
+func (b *balancer) loop() {
 	for {
 		b.mu.Lock()
-		interval := time.Duration(b.cfg.PollSeconds) * time.Second
 		stop := b.stop
 		b.mu.Unlock()
-		if err := b.poll(); err != nil {
-			b.log("warn", "cpa-balancer: poll failed", map[string]any{"error": err.Error()})
-		}
+		b.refreshAccounts()
 		b.probeStale()
 		b.mu.Lock()
 		if b.dirty {
@@ -457,69 +405,47 @@ func (b *balancer) pollLoop() {
 		select {
 		case <-stop:
 			return
-		case <-time.After(interval):
+		case <-time.After(time.Minute):
 		}
 	}
 }
 
-func (b *balancer) poll() error {
-	b.mu.Lock()
-	url := strings.TrimRight(b.cfg.ManagementURL, "/") + "/v0/management/auth-files"
-	key := b.cfg.ManagementKey
-	b.mu.Unlock()
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+// refreshAccounts syncs account identity from the host's in-process auth list.
+func (b *balancer) refreshAccounts() {
+	if b.authList == nil {
+		return
+	}
+	files, err := b.authList()
 	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("auth-files returned %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return err
-	}
-	var parsed authFilesResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return err
+		b.log("warn", "cpa-balancer: auth list failed", map[string]any{"error": err.Error()})
+		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, f := range parsed.Files {
+	for _, f := range files {
 		provider := strings.ToLower(f.Provider)
 		if provider == "" {
 			provider = strings.ToLower(f.Type)
 		}
 		a := b.accounts[f.ID]
 		if a == nil {
-			a = &account{ID: f.ID, Provider: provider}
+			a = &account{ID: f.ID}
 			b.accounts[f.ID] = a
+			b.dirty = true
 		}
 		a.Provider, a.Priority, a.Disabled = provider, f.Priority, f.Disabled
 		if f.AuthIndex != "" {
 			a.AuthIndex = f.AuthIndex
 		}
-		if f.Email != "" {
+		switch {
+		case f.Email != "":
 			a.Label = f.Email
-		} else if f.Label != "" {
+		case f.Label != "":
 			a.Label = f.Label
-		}
-		observations := []quotaObservation{f.Quota}
-		for _, o := range f.ModelQuotas {
-			observations = append(observations, o)
-		}
-		if q, ok := b.newest(provider, observations...); ok && !q.ObservedAt.Before(a.Quota.ObservedAt) {
-			a.Quota = q
+		case a.Label == "":
+			a.Label = f.Name
 		}
 	}
-	b.dirty = true
-	return nil
 }
 
 // probeStale pulls usage directly for accounts nothing has observed recently.
@@ -599,10 +525,10 @@ func (b *balancer) loadLocked() error {
 // --- inspection --------------------------------------------------------------
 
 type stateView struct {
-	Config    map[string]any     `json:"config"`
-	Accounts  []accountView      `json:"accounts"`
-	Bindings  []bindingView      `json:"bindings"`
-	Decisions []decision         `json:"decisions"`
+	Config    map[string]any `json:"config"`
+	Accounts  []accountView  `json:"accounts"`
+	Bindings  []bindingView  `json:"bindings"`
+	Decisions []decision     `json:"decisions"`
 }
 
 type accountView struct {
@@ -624,7 +550,7 @@ func (b *balancer) state() stateView {
 	now := b.now()
 	v := stateView{Config: map[string]any{
 		"shadow": b.cfg.shadow(), "k": b.cfg.K, "horizon_hours": b.cfg.HorizonHours,
-		"ttl": b.cfg.TTL, "poll_seconds": b.cfg.PollSeconds, "management_poll": b.cfg.ManagementKey != "", "state_file": b.cfg.StateFile,
+		"ttl": b.cfg.TTL, "state_file": b.cfg.StateFile,
 		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes,
 	}}
 	for _, a := range b.accounts {

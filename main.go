@@ -74,7 +74,7 @@ const pluginVersion = "0.1.0"
 
 var bal = newBalancer(hostLog)
 
-func init() { bal.authJSON = hostAuthJSON }
+func init() { bal.authJSON, bal.authList = hostAuthJSON, hostAuthList }
 
 func main() {}
 
@@ -215,9 +215,6 @@ var configFields = []pluginapi.ConfigField{
 	{Name: "shadow", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Log decisions but leave routing to CPA. Default true."},
 	{Name: "k", Type: pluginapi.ConfigFieldTypeNumber, Description: "Exponent on urgency. 1 = proportional, higher leans harder to the soonest reset. Default 1."},
 	{Name: "horizon_hours", Type: pluginapi.ConfigFieldTypeNumber, Description: "Expected session lifetime in hours, added to time-until-reset. Default 6."},
-	{Name: "poll_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "How often to read quota signals from the management API. Default 30."},
-	{Name: "management_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA base URL for the management API. Default http://127.0.0.1:8317."},
-	{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "Management API key. Without it only response headers feed quota."},
 	{Name: "state_file", Type: pluginapi.ConfigFieldTypeString, Description: "Where bindings and quota snapshot persist across restarts."},
 	{Name: "probe", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Pull usage directly from the upstream usage endpoint for accounts with no recent observation. Default true."},
 	{Name: "probe_stale_minutes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Observation age after which an account is probed. Default 60."},
@@ -295,6 +292,21 @@ func hostAuthJSON(authIndex string) ([]byte, error) {
 		return nil, err
 	}
 	return resp.JSON, nil
+}
+
+// hostAuthList returns every credential the host knows via host.auth.list.
+func hostAuthList() ([]pluginapi.HostAuthFileEntry, error) {
+	result, err := hostCall(pluginabi.MethodHostAuthList, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Files []pluginapi.HostAuthFileEntry `json:"files"`
+	}
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Files, nil
 }
 
 // hostLog forwards a log line to CPA's logger through the host callback.

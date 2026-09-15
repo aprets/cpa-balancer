@@ -19,15 +19,15 @@ var t0 = time.Date(2026, 9, 14, 19, 0, 0, 0, time.UTC)
 
 // Live signals captured from the proxy on 2026-09-14.
 var codexSignals = map[string]string{
-	"X-Codex-Plan-Type":                    "pro",
-	"X-Codex-Primary-Reset-After-Seconds":  "394022",
-	"X-Codex-Primary-Reset-At":             "1789805965",
-	"X-Codex-Primary-Used-Percent":         "28",
-	"X-Codex-Primary-Window-Minutes":       "10080",
-	"X-Codex-Secondary-Reset-After-Seconds": "0",
-	"X-Codex-Secondary-Used-Percent":       "0",
-	"X-Codex-Secondary-Window-Minutes":     "0",
-	"X-Codex-Bengalfox-Primary-Used-Percent": "0",
+	"X-Codex-Plan-Type":                        "pro",
+	"X-Codex-Primary-Reset-After-Seconds":      "394022",
+	"X-Codex-Primary-Reset-At":                 "1789805965",
+	"X-Codex-Primary-Used-Percent":             "28",
+	"X-Codex-Primary-Window-Minutes":           "10080",
+	"X-Codex-Secondary-Reset-After-Seconds":    "0",
+	"X-Codex-Secondary-Used-Percent":           "0",
+	"X-Codex-Secondary-Window-Minutes":         "0",
+	"X-Codex-Bengalfox-Primary-Used-Percent":   "0",
 	"X-Codex-Bengalfox-Primary-Window-Minutes": "300",
 }
 
@@ -43,6 +43,7 @@ var claudeSignals = map[string]string{
 func newTestBalancer(t *testing.T) *balancer {
 	t.Helper()
 	b := newBalancer(func(string, string, map[string]any) {})
+	b.running = true // tests drive refreshAccounts/probeStale/save by hand
 	b.now = func() time.Time { return t0 }
 	b.rng = rand.New(rand.NewSource(1))
 	shadow := false
@@ -251,17 +252,28 @@ func TestUsageMirrorsBindingsFeedsQuotaAndClosesLoop(t *testing.T) {
 	}
 }
 
-func TestNewestObservationAcrossModels(t *testing.T) {
+func TestRefreshAccountsFromHostAuthList(t *testing.T) {
 	b := newTestBalancer(t)
-	stale := quotaObservation{ObservedAt: "2026-09-14T10:00:00Z", Signals: map[string]string{"Anthropic-Ratelimit-Unified-7d-Utilization": "0.9"}}
-	fresh := quotaObservation{ObservedAt: "2026-09-14T12:00:00Z", Signals: map[string]string{"Anthropic-Ratelimit-Unified-7d-Utilization": "0.2"}}
-	empty := quotaObservation{}
-	q, ok := b.newest("claude", empty, stale, fresh)
-	if !ok || math.Abs(q.LongRemaining-0.8) > 1e-9 {
-		t.Fatalf("got %+v", q)
+	b.accounts["a"] = &account{ID: "a", Provider: "claude", Label: "old", Quota: quota{Known: true, LongRemaining: 0.5}}
+	b.authList = func() ([]pluginapi.HostAuthFileEntry, error) {
+		return []pluginapi.HostAuthFileEntry{
+			{ID: "a", AuthIndex: "7", Type: "claude", Email: "a@x", Priority: 1},
+			{ID: "b", AuthIndex: "8", Provider: "codex", Name: "b.json", Disabled: true},
+		}, nil
 	}
-	if _, ok := b.newest("claude", empty); ok {
-		t.Fatal("no observations must be unknown")
+	b.refreshAccounts()
+	a, ok := b.accounts["a"]
+	if !ok || a.AuthIndex != "7" || a.Label != "a@x" || a.Priority != 1 || a.Provider != "claude" {
+		t.Fatalf("existing account not updated: %+v", a)
+	}
+	if !a.Quota.Known || a.Quota.LongRemaining != 0.5 {
+		t.Fatalf("refresh must not touch quota: %+v", a.Quota)
+	}
+	if c := b.accounts["b"]; c == nil || !c.Disabled || c.Label != "b.json" || c.Provider != "codex" {
+		t.Fatalf("new account: %+v", c)
+	}
+	if !b.dirty {
+		t.Fatal("new account should mark state dirty")
 	}
 }
 

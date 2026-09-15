@@ -32,9 +32,6 @@ plugins:
       ttl: { codex: 24h, claude: 1h }
       k: 1
       horizon_hours: 6
-      poll_seconds: 30
-      management_url: http://127.0.0.1:8317
-      management_key: <management key>
       state_file: /CLIProxyAPI/plugins/cpa-balancer.state.json
 ```
 
