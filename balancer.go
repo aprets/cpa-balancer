@@ -389,6 +389,9 @@ func (b *balancer) usage(rec pluginapi.UsageRecord) {
 // through CPA. The loop only does what traffic cannot: learn which accounts
 // exist, probe the ones nothing has touched, and flush state.
 func (b *balancer) loop() {
+	// CPA attaches its auth manager after plugins load; until then host.auth.list
+	// falls back to bare on-disk entries without ids.
+	time.Sleep(3 * time.Second)
 	for {
 		b.mu.Lock()
 		stop := b.stop
@@ -423,6 +426,9 @@ func (b *balancer) refreshAccounts() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, f := range files {
+		if f.ID == "" || f.AuthIndex == "" {
+			continue
+		}
 		provider := strings.ToLower(f.Provider)
 		if provider == "" {
 			provider = strings.ToLower(f.Type)
@@ -433,10 +439,7 @@ func (b *balancer) refreshAccounts() {
 			b.accounts[f.ID] = a
 			b.dirty = true
 		}
-		a.Provider, a.Priority, a.Disabled = provider, f.Priority, f.Disabled
-		if f.AuthIndex != "" {
-			a.AuthIndex = f.AuthIndex
-		}
+		a.Provider, a.AuthIndex, a.Priority, a.Disabled = provider, f.AuthIndex, f.Priority, f.Disabled
 		switch {
 		case f.Email != "":
 			a.Label = f.Email

@@ -259,6 +259,7 @@ func TestRefreshAccountsFromHostAuthList(t *testing.T) {
 		return []pluginapi.HostAuthFileEntry{
 			{ID: "a", AuthIndex: "7", Type: "claude", Email: "a@x", Priority: 1},
 			{ID: "b", AuthIndex: "8", Provider: "codex", Name: "b.json", Disabled: true},
+			{Name: "on-disk-only.json", Type: "codex", Email: "x@y"}, // pre-manager disk fallback: no id
 		}, nil
 	}
 	b.refreshAccounts()
@@ -274,6 +275,9 @@ func TestRefreshAccountsFromHostAuthList(t *testing.T) {
 	}
 	if !b.dirty {
 		t.Fatal("new account should mark state dirty")
+	}
+	if _, ok := b.accounts[""]; ok || len(b.accounts) != 2 {
+		t.Fatalf("entries without an id must be skipped: %v", b.accounts)
 	}
 }
 
