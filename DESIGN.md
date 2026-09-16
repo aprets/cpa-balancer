@@ -105,6 +105,12 @@ fails. We want something small we fully understand.
   non-Fable traffic, which would want the overall bucket alone. The pick call
   carries the model and the headers carry both buckets, so this is a small
   change. Build it when non-Fable traffic through the proxy becomes real.
+- Tapering placements ahead of a reset. Today an account gets more
+  attractive as its reset approaches, capped by the horizon term, so a
+  session placed minutes before the reset just refills under itself. The
+  only forced move is exhaustion (a 429 makes CPA pull the account). If that
+  ever bites, add a taper for the last hour or two before reset next to the
+  horizon term; the cost is quota left unspent on purpose.
 - Replaying historical requests. CPA request logs are full bodies (~700 KB
   each, 1 GB cap) and rotate within days; Keeper has no quota history.
   Shadow mode on live traffic is cheaper and more honest.
