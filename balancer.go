@@ -25,6 +25,10 @@ type config struct {
 	// ProbeStaleMinutes is how old an observation may be before the account is
 	// probed directly. Accounts with traffic never get this old.
 	ProbeStaleMinutes int `yaml:"probe_stale_minutes"`
+	// Redeem Codex reset credits this many minutes before they expire. See
+	// credits.go.
+	Redeem            *bool `yaml:"redeem"`
+	RedeemLeadMinutes int   `yaml:"redeem_lead_minutes"`
 }
 
 // fill copies defaults for providers the config leaves unset or non-positive.
@@ -52,6 +56,7 @@ func (c config) horizonFor(provider string) float64 {
 
 func (c config) shadow() bool { return c.Shadow == nil || *c.Shadow }
 func (c config) probe() bool  { return c.Probe == nil || *c.Probe }
+func (c config) redeem() bool { return c.Redeem == nil || *c.Redeem }
 
 func (c config) withDefaults() config {
 	// Horizon is where the cost of a forced move lives: an hour of cache on
@@ -59,6 +64,9 @@ func (c config) withDefaults() config {
 	c.HorizonHours = fill(c.HorizonHours, map[string]float64{"claude": 2, "codex": 6})
 	if c.ProbeStaleMinutes <= 0 {
 		c.ProbeStaleMinutes = 60
+	}
+	if c.RedeemLeadMinutes <= 0 {
+		c.RedeemLeadMinutes = 15
 	}
 	if c.StateFile == "" {
 		c.StateFile = "plugins/cpa-balancer.state.json"
@@ -84,6 +92,8 @@ type account struct {
 	Disabled  bool   `json:"disabled,omitempty"`
 	Quota     quota  `json:"quota"`
 	lastProbe time.Time
+	Credits   []credit `json:"credits,omitempty"` // available Codex reset credits, see credits.go
+	creditsAt time.Time // when Credits was last read
 }
 
 type binding struct {
@@ -164,7 +174,7 @@ func (b *balancer) configure(cfg config) {
 	}
 	b.log("info", "cpa-balancer configured", map[string]any{
 		"shadow": b.cfg.shadow(), "k": k, "horizon_hours": b.cfg.HorizonHours, "ttl": b.cfg.TTL,
-		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes,
+		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes, "redeem": b.cfg.redeem() && b.authJSON != nil, "redeem_lead_minutes": b.cfg.RedeemLeadMinutes,
 		"state_file": b.cfg.StateFile, "bindings": len(b.bindings), "accounts": len(b.accounts),
 	})
 }
@@ -431,6 +441,7 @@ func (b *balancer) loop() {
 		b.mu.Unlock()
 		b.refreshAccounts()
 		b.probeStale()
+		b.redeemExpiring()
 		b.mu.Lock()
 		if b.dirty {
 			if err := b.saveLocked(); err != nil {
@@ -601,7 +612,7 @@ func (b *balancer) state() stateView {
 	v := stateView{Config: map[string]any{
 		"shadow": b.cfg.shadow(), "k": k, "horizon_hours": b.cfg.HorizonHours,
 		"ttl": b.cfg.TTL, "state_file": b.cfg.StateFile,
-		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes,
+		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes, "redeem": b.cfg.redeem() && b.authJSON != nil, "redeem_lead_minutes": b.cfg.RedeemLeadMinutes,
 	}}
 	for _, a := range b.accounts {
 		av := accountView{account: *a}

@@ -93,10 +93,25 @@ fails. We want something small we fully understand.
    returns config, accounts with current weights, bindings and recent
    decisions. Use curl.
 
+## Reset credits
+
+Codex grants "Full reset" credits that zero the weekly and 5h meters when
+redeemed and expire 30 days after grant. A
+credit is worth exactly the usage it wipes, so one that expires unused is
+lost outright. The plugin re-reads each Codex account's credit list hourly
+(`GET wham/rate-limit-reset-credits`, the same endpoint the Codex CLI uses) and, `redeem_lead_minutes` (15) before a credit expires, redeems it by
+id (`POST .../consume` with a fresh `redeem_request_id`). Disabled accounts
+are included: a credit on a parked account is still a credit. Failures retry
+every minute until expiry. Redeeming by id means a retry after an ambiguous
+timeout cannot burn a second credit.
+
+Routing does not yet lean on an expiring credit. The obvious extension is to
+treat the soonest credit expiry as the account's effective reset so load
+concentrates there first; do that once demand actually exceeds capacity,
+since below capacity a redeem at 5% used is worth 5% whatever we do.
+
 ## Explicitly not doing
 
-- Banked/credit resets. Revisit later; the failure mode is burning a second
-  credit on an ambiguous timeout.
 - Any UI.
 - Per-model routing. Claude has an all-models weekly bucket and a smaller
   Fable-scoped one (`7d_oi`); the plugin rates an account by whichever is

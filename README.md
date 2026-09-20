@@ -32,6 +32,7 @@ plugins:
       ttl: { codex: 24h, claude: 1h }
       horizon_hours: { claude: 2, codex: 6 } # how far ahead a placement draws
       state_file: /CLIProxyAPI/plugins/cpa-balancer.state.json
+      redeem_lead_minutes: 15      # redeem Codex reset credits this close to expiry (redeem: false to stop)
 ```
 
 Inspect it with:

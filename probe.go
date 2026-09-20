@@ -50,26 +50,36 @@ func (b *balancer) probeDueLocked(now time.Time) []probeTarget {
 	return due
 }
 
-// probe fetches one account's usage. Called without the lock.
-func (b *balancer) probe(t probeTarget, now time.Time) (quota, error) {
-	raw, err := b.authJSON(t.authIndex)
+// authToken reads the account's OAuth token and ChatGPT account id from the
+// host's copy of its auth file.
+func (b *balancer) authToken(authIndex string) (token, accountID string, err error) {
+	raw, err := b.authJSON(authIndex)
 	if err != nil {
-		return quota{}, fmt.Errorf("auth json: %w", err)
+		return "", "", fmt.Errorf("auth json: %w", err)
 	}
 	var auth struct {
 		AccessToken string `json:"access_token"`
 		AccountID   string `json:"account_id"`
 	}
 	if err := json.Unmarshal(raw, &auth); err != nil || auth.AccessToken == "" {
-		return quota{}, errors.New("no access token in auth json")
+		return "", "", errors.New("no access token in auth json")
+	}
+	return auth.AccessToken, auth.AccountID, nil
+}
+
+// probe fetches one account's usage. Called without the lock.
+func (b *balancer) probe(t probeTarget, now time.Time) (quota, error) {
+	token, accountID, err := b.authToken(t.authIndex)
+	if err != nil {
+		return quota{}, err
 	}
 	var req *http.Request
 	switch t.provider {
 	case "codex":
 		req, _ = http.NewRequest(http.MethodGet, codexUsageURL, nil)
 		req.Header.Set("User-Agent", "codex_cli_rs/0.120.0")
-		if auth.AccountID != "" {
-			req.Header.Set("chatgpt-account-id", auth.AccountID)
+		if accountID != "" {
+			req.Header.Set("chatgpt-account-id", accountID)
 		}
 	case "claude":
 		req, _ = http.NewRequest(http.MethodGet, claudeUsageURL, nil)
@@ -78,7 +88,7 @@ func (b *balancer) probe(t probeTarget, now time.Time) (quota, error) {
 	default:
 		return quota{}, fmt.Errorf("no probe for provider %q", t.provider)
 	}
-	req.Header.Set("Authorization", "Bearer "+auth.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
 	resp, err := b.http.Do(req)
 	if err != nil {

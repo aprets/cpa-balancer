@@ -216,6 +216,8 @@ var configFields = []pluginapi.ConfigField{
 	{Name: "state_file", Type: pluginapi.ConfigFieldTypeString, Description: "Where bindings and quota snapshot persist across restarts."},
 	{Name: "probe", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Pull usage directly from the upstream usage endpoint for accounts with no recent observation. Default true."},
 	{Name: "probe_stale_minutes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Observation age after which an account is probed. Default 60."},
+	{Name: "redeem", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Redeem Codex reset credits shortly before they expire so they are not lost. Default true."},
+	{Name: "redeem_lead_minutes", Type: pluginapi.ConfigFieldTypeInteger, Description: "How many minutes before expiry a reset credit is redeemed. Default 15."},
 }
 
 func okEnvelope(v any) ([]byte, error) {
