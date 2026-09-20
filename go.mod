@@ -1,4 +1,4 @@
-module localflare/cpa-balancer
+module github.com/aprets/cpa-balancer
 
 go 1.26.0
 

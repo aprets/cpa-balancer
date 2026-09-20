@@ -170,8 +170,8 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 			Metadata: pluginapi.Metadata{
 				Name:             pluginName,
 				Version:          pluginVersion,
-				Author:           "localflare",
-				GitHubRepository: "https://github.com/aprets/localflare",
+				Author:           "aprets",
+				GitHubRepository: "https://github.com/aprets/cpa-balancer",
 				ConfigFields:     configFields,
 			},
 			Capabilities: map[string]bool{"scheduler": true, "usage_plugin": true, "management_api": true},
