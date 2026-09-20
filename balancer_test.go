@@ -40,6 +40,9 @@ var claudeSignals = map[string]string{
 	"Anthropic-Ratelimit-Unified-Status":            "allowed",
 }
 
+// wq wraps a quota in a bare account for weight().
+func wq(q quota) *account { return &account{Quota: q} }
+
 func newTestBalancer(t *testing.T) *balancer {
 	t.Helper()
 	b := newBalancer(func(string, string, map[string]any) {})
@@ -98,7 +101,7 @@ func TestWeightPrefersSoonerReset(t *testing.T) {
 	urgent := quota{Known: true, LongRemaining: 0.94, LongResetAt: t0.Add(36 * time.Hour)}
 	relaxed := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(120 * time.Hour)}
 	// Urgency ratio is about 5.6; k=4 raises that to about 1000.
-	ratio := b.weight(urgent, "claude", t0) / b.weight(relaxed, "claude", t0)
+	ratio := b.weight(wq(urgent), "claude", t0) / b.weight(wq(relaxed), "claude", t0)
 	if ratio < 900 || ratio > 1100 {
 		t.Fatalf("ratio = %v, want about 1000", ratio)
 	}
@@ -108,7 +111,7 @@ func TestHorizonDefusesNearlyEmptyAccount(t *testing.T) {
 	b := newTestBalancer(t)
 	trap := quota{Known: true, LongRemaining: 0.02, LongResetAt: t0.Add(time.Hour)}
 	healthy := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(24 * time.Hour)}
-	if b.weight(trap, "claude", t0) >= b.weight(healthy, "claude", t0) {
+	if b.weight(wq(trap), "claude", t0) >= b.weight(wq(healthy), "claude", t0) {
 		t.Fatal("2% left resetting in an hour must not beat 50% left resetting tomorrow")
 	}
 }
@@ -116,13 +119,13 @@ func TestHorizonDefusesNearlyEmptyAccount(t *testing.T) {
 func TestHeadroomAndK(t *testing.T) {
 	b := newTestBalancer(t)
 	q := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(24 * time.Hour)}
-	base := b.weight(q, "claude", t0)
+	base := b.weight(wq(q), "claude", t0)
 	if math.Abs(base-math.Pow(0.5/30, k)) > 1e-15 {
 		t.Fatalf("weight = %v, want urgency^k", base)
 	}
 	full := q
 	full.ShortUtil = 0.9
-	if math.Abs(b.weight(full, "claude", t0)/base-0.1) > 1e-9 {
+	if math.Abs(b.weight(wq(full), "claude", t0)/base-0.1) > 1e-9 {
 		t.Fatal("90% short-window utilization must scale weight by 0.1")
 	}
 }
@@ -131,7 +134,7 @@ func TestResetInThePastMeansFull(t *testing.T) {
 	b := newTestBalancer(t)
 	stale := quota{Known: true, LongRemaining: 0.01, LongResetAt: t0.Add(-time.Hour)}
 	fresh := quota{Known: true, LongRemaining: 1, LongResetAt: t0.Add(168 * time.Hour)}
-	if math.Abs(b.weight(stale, "claude", t0)-b.weight(fresh, "claude", t0)) > 1e-12 {
+	if math.Abs(b.weight(wq(stale), "claude", t0)-b.weight(wq(fresh), "claude", t0)) > 1e-12 {
 		t.Fatal("an account whose reset has passed counts as full")
 	}
 }
@@ -265,7 +268,7 @@ func TestPerProviderDefaults(t *testing.T) {
 	b := newTestBalancer(t)
 	b.cfg = config{}.withDefaults()
 	q := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(10 * time.Hour)}
-	if math.Abs(b.weight(q, "claude", t0)-math.Pow(0.5/12, 4)) > 1e-12 || math.Abs(b.weight(q, "codex", t0)-math.Pow(0.5/16, 4)) > 1e-12 {
+	if math.Abs(b.weight(wq(q), "claude", t0)-math.Pow(0.5/12, 4)) > 1e-12 || math.Abs(b.weight(wq(q), "codex", t0)-math.Pow(0.5/16, 4)) > 1e-12 {
 		t.Fatal("weight must use the provider's own horizon")
 	}
 }
@@ -446,4 +449,19 @@ func (r rewriteTo) RoundTrip(req *http.Request) (*http.Response, error) {
 	u, _ := url.Parse(string(r))
 	req.URL.Scheme, req.URL.Host = u.Scheme, u.Host
 	return http.DefaultTransport.RoundTrip(req)
+}
+
+func TestRedeemableCreditCountsAsReset(t *testing.T) {
+	b := newTestBalancer(t)
+	window := quota{Known: true, LongRemaining: 0.9, LongResetAt: t0.Add(120 * time.Hour)}
+	a := &account{Quota: window, Credits: []credit{{ID: "later", ExpiresAt: t0.Add(200 * time.Hour)}, {ID: "soon", ExpiresAt: t0.Add(10 * time.Hour)}, {ID: "past", ExpiresAt: t0.Add(-time.Hour)}}}
+	asIfReset := quota{Known: true, LongRemaining: 0.9, LongResetAt: t0.Add(10 * time.Hour)}
+	if got, want := b.weight(a, "codex", t0), b.weight(wq(asIfReset), "codex", t0); got != want {
+		t.Fatalf("soonest future credit expiry must act as the reset: got %v want %v", got, want)
+	}
+	off := false
+	b.cfg.Redeem = &off
+	if got, want := b.weight(a, "codex", t0), b.weight(wq(window), "codex", t0); got != want {
+		t.Fatalf("with redeem off credits must not change routing: got %v want %v", got, want)
+	}
 }

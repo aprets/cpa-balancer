@@ -105,10 +105,12 @@ are included: a credit on a parked account is still a credit. Failures retry
 every minute until expiry. Redeeming by id means a retry after an ambiguous
 timeout cannot burn a second credit.
 
-Routing does not yet lean on an expiring credit. The obvious extension is to
-treat the soonest credit expiry as the account's effective reset so load
-concentrates there first; do that once demand actually exceeds capacity,
-since below capacity a redeem at 5% used is worth 5% whatever we do.
+Routing treats the soonest such credit as the account's reset when it comes
+before the window's own: whatever is left in the window is gone at that
+moment, so the usual urgency term pulls load there first and the redeem is
+worth more. Verified live on 2026-09-20: `code: reset`, and the usage
+endpoint caught up about twenty seconds later with the weekly meter at 0% and
+its reset moved to seven days from the redeem.
 
 ## Explicitly not doing
 

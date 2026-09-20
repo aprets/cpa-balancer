@@ -318,7 +318,7 @@ func (b *balancer) weightsLocked(cands []pluginapi.SchedulerAuthCandidate, now t
 			unknown = append(unknown, c.ID)
 			continue
 		}
-		w := b.weight(a.Quota, strings.ToLower(c.Provider), now)
+		w := b.weight(a, strings.ToLower(c.Provider), now)
 		weights[c.ID] = w
 		known = append(known, w)
 	}
@@ -345,11 +345,22 @@ const k = 4
 // weight implements the formula in DESIGN.md. CPA priority is not part of it:
 // the host only offers the highest-priority tier as candidates, so priority
 // is already a hard override before the plugin runs.
-func (b *balancer) weight(q quota, provider string, now time.Time) float64 {
+func (b *balancer) weight(a *account, provider string, now time.Time) float64 {
+	q := a.Quota
 	remaining := q.LongRemaining
+	resetAt := q.LongResetAt
+	// A reset credit the plugin will redeem is a reset like any other: what is
+	// left in the window is gone at that moment, so spend it before then.
+	if b.cfg.redeem() {
+		for _, c := range a.Credits {
+			if c.ExpiresAt.After(now) && (resetAt.IsZero() || c.ExpiresAt.Before(resetAt)) {
+				resetAt = c.ExpiresAt
+			}
+		}
+	}
 	hours := 168.0 // reset unknown: assume a full week away
-	if !q.LongResetAt.IsZero() {
-		hours = q.LongResetAt.Sub(now).Hours()
+	if !resetAt.IsZero() {
+		hours = resetAt.Sub(now).Hours()
 		if hours < 0 {
 			// The window reset after we last observed it: the account is full
 			// again and we do not yet know the next reset.
@@ -617,7 +628,7 @@ func (b *balancer) state() stateView {
 	for _, a := range b.accounts {
 		av := accountView{account: *a}
 		if a.Quota.Known && !a.Disabled {
-			av.Weight = b.weight(a.Quota, a.Provider, now)
+			av.Weight = b.weight(a, a.Provider, now)
 		}
 		v.Accounts = append(v.Accounts, av)
 	}
