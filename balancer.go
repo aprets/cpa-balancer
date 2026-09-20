@@ -458,10 +458,12 @@ func (b *balancer) refreshAccounts() {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	seen := map[string]bool{}
 	for _, f := range files {
 		if f.ID == "" || f.AuthIndex == "" {
 			continue
 		}
+		seen[f.ID] = true
 		provider := strings.ToLower(f.Provider)
 		if provider == "" {
 			provider = strings.ToLower(f.Type)
@@ -480,6 +482,18 @@ func (b *balancer) refreshAccounts() {
 			a.Label = f.Label
 		case a.Label == "":
 			a.Label = f.Name
+		}
+	}
+	// Forget accounts whose auth file is gone (renamed, deleted), else they
+	// would be probed forever. An empty listing is the pre-manager disk
+	// fallback, not a removal, so only prune once real entries are listed.
+	if len(seen) == 0 {
+		return
+	}
+	for id := range b.accounts {
+		if !seen[id] {
+			delete(b.accounts, id)
+			b.dirty = true
 		}
 	}
 }

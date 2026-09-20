@@ -299,6 +299,27 @@ func TestRefreshAccountsFromHostAuthList(t *testing.T) {
 	}
 }
 
+func TestRefreshAccountsPrunesRemovedAuths(t *testing.T) {
+	b := newTestBalancer(t)
+	b.accounts["gone"] = &account{ID: "gone", Provider: "codex", AuthIndex: "1"}
+	b.accounts["kept"] = &account{ID: "kept", Provider: "codex", AuthIndex: "2"}
+	b.authList = func() ([]pluginapi.HostAuthFileEntry, error) {
+		return []pluginapi.HostAuthFileEntry{{Name: "disk-only.json", Type: "codex"}}, nil
+	}
+	b.refreshAccounts()
+	if len(b.accounts) != 2 {
+		t.Fatalf("id-less disk fallback must not prune: %v", b.accounts)
+	}
+	b.dirty = false
+	b.authList = func() ([]pluginapi.HostAuthFileEntry, error) {
+		return []pluginapi.HostAuthFileEntry{{ID: "kept", AuthIndex: "2", Type: "codex"}}, nil
+	}
+	b.refreshAccounts()
+	if _, ok := b.accounts["gone"]; ok || len(b.accounts) != 1 || !b.dirty {
+		t.Fatalf("removed auth must be pruned and state marked dirty: %v dirty=%v", b.accounts, b.dirty)
+	}
+}
+
 func TestUsageMatchesDecisionByFullSessionID(t *testing.T) {
 	b := newTestBalancer(t)
 	b.configure(config{StateFile: b.cfg.StateFile})
