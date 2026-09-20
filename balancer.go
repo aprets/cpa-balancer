@@ -92,7 +92,7 @@ type account struct {
 	Disabled  bool   `json:"disabled,omitempty"`
 	Quota     quota  `json:"quota"`
 	lastProbe time.Time
-	Credits   []credit `json:"credits,omitempty"` // available Codex reset credits, see credits.go
+	Credits   []credit  `json:"credits,omitempty"` // available Codex reset credits, see credits.go
 	creditsAt time.Time // when Credits was last read
 }
 
