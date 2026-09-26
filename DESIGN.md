@@ -112,16 +112,28 @@ worth more. Verified live on 2026-09-20: `code: reset`, and the usage
 endpoint caught up about twenty seconds later with the weekly meter at 0% and
 its reset moved to seven days from the redeem.
 
+## Model-scoped limits
+
+Claude has a weekly limit shared by all models and a smaller one scoped to
+Fable (`weekly_scoped` in the usage endpoint, `7d_oi` in response headers).
+Fable counts against both; other models only against the shared one. The
+plugin keeps the two apart and scores each pick by its model: a model that
+counts against the scoped limit is rated on the worse of the two, any other
+model on the shared limit alone. Non-Fable traffic therefore lands where
+Fable is spent but shared room is left, and keeps the Fable-rich accounts'
+shared room for Fable.
+
+Which models count is learned, not listed. Anthropic sends the `7d_oi`
+headers only on responses from models the scoped limit covers, so each
+response records its model as scoped or not. Only accounts that have a scoped
+limit can mark a model unscoped. A model with no response yet is rated on the
+worse of the two limits, the old behaviour. The map is saved with the rest of
+the state, so it is learned once, not after every restart. A response without
+`7d_oi` keeps the account's last scoped value for the same week.
+
 ## Explicitly not doing
 
 - Any UI.
-- Per-model routing. Claude has an all-models weekly bucket and a smaller
-  Fable-scoped one (`7d_oi`); the plugin rates an account by whichever is
-  fuller, which is exactly right for Fable traffic and merely cautious if
-  something else has eaten the overall bucket. It is wrong only for routing
-  non-Fable traffic, which would want the overall bucket alone. The pick call
-  carries the model and the headers carry both buckets, so this is a small
-  change. Build it when non-Fable traffic through the proxy becomes real.
 - Tapering placements ahead of a reset. Today an account gets more
   attractive as its reset approaches, capped by the horizon term, so a
   session placed minutes before the reset just refills under itself. The

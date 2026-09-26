@@ -18,6 +18,10 @@ type quota struct {
 	LongResetAt   time.Time `json:"long_reset_at"`
 	ShortUtil     float64   `json:"short_util"` // 0..1, 0 when no short window
 	ObservedAt    time.Time `json:"observed_at"`
+	// Scoped is the remaining share of a model-scoped weekly limit (Claude's
+	// Fable limit), nil when the account reports none. It shares LongResetAt.
+	// Only models that count against it are scored on it, see weight.
+	Scoped *float64 `json:"scoped_remaining,omitempty"`
 }
 
 // parseSignals reads CPA's retained quota headers for one account. Keys are
@@ -81,13 +85,14 @@ func parseClaude(sig map[string]string, observed time.Time) quota {
 		return quota{}
 	}
 	util, _ := strconv.ParseFloat(weekly, 64)
-	// The model-specific weekly window (7d_oi, Fable) is what we mostly burn.
-	if oi, ok := sig[p+"7d_oi-utilization"]; ok {
-		if v, _ := strconv.ParseFloat(oi, 64); v > util {
-			util = v
-		}
-	}
 	q := quota{Known: true, LongRemaining: clamp01(1 - util), ObservedAt: observed}
+	// 7d_oi is the Fable weekly limit. Anthropic only sends it on responses
+	// from models that count against it, which is how models get classified.
+	if oi, ok := sig[p+"7d_oi-utilization"]; ok {
+		v, _ := strconv.ParseFloat(oi, 64)
+		scoped := clamp01(1 - v)
+		q.Scoped = &scoped
+	}
 	if unix, _ := strconv.ParseInt(sig[p+"7d-reset"], 10, 64); unix > 0 {
 		q.LongResetAt = time.Unix(unix, 0).UTC()
 	}

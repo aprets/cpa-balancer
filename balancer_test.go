@@ -88,8 +88,11 @@ func TestParseCodexTwoWindows(t *testing.T) {
 
 func TestParseClaudeSignals(t *testing.T) {
 	q := parseSignals("claude", claudeSignals, t0)
-	if !q.Known || math.Abs(q.LongRemaining-0.87) > 1e-9 || math.Abs(q.ShortUtil-0.26) > 1e-9 || q.LongResetAt.Unix() != 1789542000 {
+	if !q.Known || math.Abs(q.LongRemaining-0.94) > 1e-9 || math.Abs(q.ShortUtil-0.26) > 1e-9 || q.LongResetAt.Unix() != 1789542000 {
 		t.Fatalf("got %+v", q)
+	}
+	if q.Scoped == nil || math.Abs(*q.Scoped-0.87) > 1e-9 {
+		t.Fatalf("7d_oi is the scoped limit, got %v", q.Scoped)
 	}
 	if parseSignals("claude", map[string]string{"Retry-After": "5"}, t0).Known {
 		t.Fatal("no weekly window must be unknown")
@@ -101,7 +104,7 @@ func TestWeightPrefersSoonerReset(t *testing.T) {
 	urgent := quota{Known: true, LongRemaining: 0.94, LongResetAt: t0.Add(36 * time.Hour)}
 	relaxed := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(120 * time.Hour)}
 	// Urgency ratio is about 5.6; k=4 raises that to about 1000.
-	ratio := b.weight(wq(urgent), "claude", t0) / b.weight(wq(relaxed), "claude", t0)
+	ratio := b.weight(wq(urgent), "claude", "", t0) / b.weight(wq(relaxed), "claude", "", t0)
 	if ratio < 900 || ratio > 1100 {
 		t.Fatalf("ratio = %v, want about 1000", ratio)
 	}
@@ -111,7 +114,7 @@ func TestHorizonDefusesNearlyEmptyAccount(t *testing.T) {
 	b := newTestBalancer(t)
 	trap := quota{Known: true, LongRemaining: 0.02, LongResetAt: t0.Add(time.Hour)}
 	healthy := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(24 * time.Hour)}
-	if b.weight(wq(trap), "claude", t0) >= b.weight(wq(healthy), "claude", t0) {
+	if b.weight(wq(trap), "claude", "", t0) >= b.weight(wq(healthy), "claude", "", t0) {
 		t.Fatal("2% left resetting in an hour must not beat 50% left resetting tomorrow")
 	}
 }
@@ -119,13 +122,13 @@ func TestHorizonDefusesNearlyEmptyAccount(t *testing.T) {
 func TestHeadroomAndK(t *testing.T) {
 	b := newTestBalancer(t)
 	q := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(24 * time.Hour)}
-	base := b.weight(wq(q), "claude", t0)
+	base := b.weight(wq(q), "claude", "", t0)
 	if math.Abs(base-math.Pow(0.5/30, k)) > 1e-15 {
 		t.Fatalf("weight = %v, want urgency^k", base)
 	}
 	full := q
 	full.ShortUtil = 0.9
-	if math.Abs(b.weight(wq(full), "claude", t0)/base-0.1) > 1e-9 {
+	if math.Abs(b.weight(wq(full), "claude", "", t0)/base-0.1) > 1e-9 {
 		t.Fatal("90% short-window utilization must scale weight by 0.1")
 	}
 }
@@ -134,7 +137,7 @@ func TestResetInThePastMeansFull(t *testing.T) {
 	b := newTestBalancer(t)
 	stale := quota{Known: true, LongRemaining: 0.01, LongResetAt: t0.Add(-time.Hour)}
 	fresh := quota{Known: true, LongRemaining: 1, LongResetAt: t0.Add(168 * time.Hour)}
-	if math.Abs(b.weight(wq(stale), "claude", t0)-b.weight(wq(fresh), "claude", t0)) > 1e-12 {
+	if math.Abs(b.weight(wq(stale), "claude", "", t0)-b.weight(wq(fresh), "claude", "", t0)) > 1e-12 {
 		t.Fatal("an account whose reset has passed counts as full")
 	}
 }
@@ -162,11 +165,11 @@ func TestUnknownGetsMedian(t *testing.T) {
 	b := newTestBalancer(t)
 	b.accounts["a"] = &account{ID: "a", Provider: "claude", Quota: quota{Known: true, LongRemaining: 0.9, LongResetAt: t0.Add(24 * time.Hour)}}
 	b.accounts["b"] = &account{ID: "b", Provider: "claude", Quota: quota{Known: true, LongRemaining: 0.1, LongResetAt: t0.Add(24 * time.Hour)}}
-	w := b.weightsLocked(cands("a", "b", "c"), t0)
+	w := b.weightsLocked(cands("a", "b", "c"), "", t0)
 	if math.Abs(w["c"]-(w["a"]+w["b"])/2) > 1e-12 {
 		t.Fatalf("unknown c = %v, want median of %v and %v", w["c"], w["a"], w["b"])
 	}
-	if w := b.weightsLocked(cands("x", "y"), t0); w["x"] != 1 || w["y"] != 1 {
+	if w := b.weightsLocked(cands("x", "y"), "", t0); w["x"] != 1 || w["y"] != 1 {
 		t.Fatal("all unknown must be uniform")
 	}
 }
@@ -249,7 +252,7 @@ func TestUsageMirrorsBindingsFeedsQuotaAndClosesLoop(t *testing.T) {
 	if bd := b.bindings[bindingKey("claude", "sess-1")]; bd == nil || bd.AuthID != other {
 		t.Fatal("usage must mirror CPA's actual choice")
 	}
-	if q := b.accounts[other].Quota; !q.Known || math.Abs(q.LongRemaining-0.87) > 1e-9 {
+	if q := b.accounts[other].Quota; !q.Known || math.Abs(q.LongRemaining-0.94) > 1e-9 || q.Scoped == nil {
 		t.Fatalf("quota from headers: %+v", q)
 	}
 	if d := b.decisions[len(b.decisions)-1]; d.Actual != other {
@@ -268,7 +271,7 @@ func TestPerProviderDefaults(t *testing.T) {
 	b := newTestBalancer(t)
 	b.cfg = config{}.withDefaults()
 	q := quota{Known: true, LongRemaining: 0.5, LongResetAt: t0.Add(10 * time.Hour)}
-	if math.Abs(b.weight(wq(q), "claude", t0)-math.Pow(0.5/12, 4)) > 1e-12 || math.Abs(b.weight(wq(q), "codex", t0)-math.Pow(0.5/16, 4)) > 1e-12 {
+	if math.Abs(b.weight(wq(q), "claude", "", t0)-math.Pow(0.5/12, 4)) > 1e-12 || math.Abs(b.weight(wq(q), "codex", "", t0)-math.Pow(0.5/16, 4)) > 1e-12 {
 		t.Fatal("weight must use the provider's own horizon")
 	}
 }
@@ -385,10 +388,13 @@ func TestParseClaudeUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// weekly_scoped (42%) in limits[] is worse than seven_day (11%) and
-	// seven_day_opus (20%), so remaining is 0.58.
-	if math.Abs(q.LongRemaining-0.58) > 1e-9 || math.Abs(q.ShortUtil-0.44) > 1e-9 {
+	// The shared weekly is 11% used. The scoped limits are weekly_scoped (42%)
+	// and seven_day_opus (20%); the worse of them is kept apart as Scoped.
+	if math.Abs(q.LongRemaining-0.89) > 1e-9 || math.Abs(q.ShortUtil-0.44) > 1e-9 {
 		t.Fatalf("got %+v", q)
+	}
+	if q.Scoped == nil || math.Abs(*q.Scoped-0.58) > 1e-9 {
+		t.Fatalf("scoped = %v", q.Scoped)
 	}
 	if q.LongResetAt.UTC().Format(time.RFC3339) != "2026-09-16T07:00:00Z" {
 		t.Fatalf("reset = %v", q.LongResetAt)
@@ -428,7 +434,7 @@ func TestProbeStaleAccountsThroughStubbedUpstream(t *testing.T) {
 	if q := b.accounts["cx"].Quota; !q.Known || math.Abs(q.LongRemaining-0.7) > 1e-9 {
 		t.Fatalf("codex not probed: %+v", q)
 	}
-	if q := b.accounts["cl"].Quota; !q.Known || math.Abs(q.LongRemaining-0.58) > 1e-9 {
+	if q := b.accounts["cl"].Quota; !q.Known || math.Abs(q.LongRemaining-0.89) > 1e-9 || q.Scoped == nil || math.Abs(*q.Scoped-0.58) > 1e-9 {
 		t.Fatalf("claude not probed: %+v", q)
 	}
 	b.probeStale()
@@ -456,12 +462,81 @@ func TestRedeemableCreditCountsAsReset(t *testing.T) {
 	window := quota{Known: true, LongRemaining: 0.9, LongResetAt: t0.Add(120 * time.Hour)}
 	a := &account{Quota: window, Credits: []credit{{ID: "later", ExpiresAt: t0.Add(200 * time.Hour)}, {ID: "soon", ExpiresAt: t0.Add(10 * time.Hour)}, {ID: "past", ExpiresAt: t0.Add(-time.Hour)}}}
 	asIfReset := quota{Known: true, LongRemaining: 0.9, LongResetAt: t0.Add(10 * time.Hour)}
-	if got, want := b.weight(a, "codex", t0), b.weight(wq(asIfReset), "codex", t0); got != want {
+	if got, want := b.weight(a, "codex", "", t0), b.weight(wq(asIfReset), "codex", "", t0); got != want {
 		t.Fatalf("soonest future credit expiry must act as the reset: got %v want %v", got, want)
 	}
 	off := false
 	b.cfg.Redeem = &off
-	if got, want := b.weight(a, "codex", t0), b.weight(wq(window), "codex", t0); got != want {
+	if got, want := b.weight(a, "codex", "", t0), b.weight(wq(window), "codex", "", t0); got != want {
 		t.Fatalf("with redeem off credits must not change routing: got %v want %v", got, want)
+	}
+}
+
+// An account whose Fable limit is nearly spent still has shared room. Fable
+// requests (and models not yet seen) must be scored on the Fable limit, other
+// models on the shared one.
+func TestWeightUsesScopedLimitOnlyForScopedModels(t *testing.T) {
+	b := newTestBalancer(t)
+	fable := 0.18
+	a := wq(quota{Known: true, LongRemaining: 0.47, Scoped: &fable, LongResetAt: t0.Add(24 * time.Hour)})
+	scoped := b.weight(wq(quota{Known: true, LongRemaining: 0.18, LongResetAt: t0.Add(24 * time.Hour)}), "claude", "", t0)
+	shared := b.weight(wq(quota{Known: true, LongRemaining: 0.47, LongResetAt: t0.Add(24 * time.Hour)}), "claude", "", t0)
+	if got := b.weight(a, "claude", "claude-opus-5-5", t0); got != scoped {
+		t.Fatalf("unseen model must get the conservative score: %v vs %v", got, scoped)
+	}
+	b.scoped["claude-opus-5-5"] = false
+	b.scoped["claude-fable-5-1"] = true
+	if got := b.weight(a, "claude", "claude-opus-5-5", t0); got != shared {
+		t.Fatalf("opus must use the shared limit: %v vs %v", got, shared)
+	}
+	if got := b.weight(a, "claude", "claude-fable-5-1", t0); got != scoped {
+		t.Fatalf("fable must use the scoped limit: %v vs %v", got, scoped)
+	}
+}
+
+// Responses teach which models count against the scoped limit, and an Opus
+// response (no 7d_oi) must not erase the Fable value a Fable response left.
+func TestUsageLearnsScopedModelsAndKeepsScopedValue(t *testing.T) {
+	b := newTestBalancer(t)
+	headers := func(withOI bool) http.Header {
+		h := http.Header{}
+		for k, v := range claudeSignals {
+			if withOI || !strings.Contains(k, "7d_oi") {
+				h.Set(k, v)
+			}
+		}
+		return h
+	}
+	b.usage(pluginapi.UsageRecord{Provider: "claude", AuthID: "a", Model: "claude-fable-5-1[1m]", ResponseHeaders: headers(true)})
+	b.now = func() time.Time { return t0.Add(time.Minute) }
+	b.usage(pluginapi.UsageRecord{Provider: "claude", AuthID: "a", Model: "claude-opus-5-5", ResponseHeaders: headers(false)})
+	if s, ok := b.scoped["claude-fable-5-1"]; !ok || !s {
+		t.Fatalf("fable not learned as scoped: %v", b.scoped)
+	}
+	if s, ok := b.scoped["claude-opus-5-5"]; !ok || s {
+		t.Fatalf("opus not learned as shared-only: %v", b.scoped)
+	}
+	if q := b.accounts["a"].Quota; q.Scoped == nil || math.Abs(*q.Scoped-0.87) > 1e-9 {
+		t.Fatalf("opus response must keep the fable value: %+v", q)
+	}
+	b.usage(pluginapi.UsageRecord{Provider: "claude", AuthID: "no-limit", Model: "claude-fable-5-1", ResponseHeaders: headers(false)})
+	if !b.scoped["claude-fable-5-1"] {
+		t.Fatal("an account without a scoped limit must not unlearn fable")
+	}
+	if err := b.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	c := newBalancer(func(string, string, map[string]any) {})
+	c.cfg.StateFile = b.cfg.StateFile
+	if err := c.loadLocked(); err != nil || !c.scoped["claude-fable-5-1"] || c.scoped["claude-opus-5-5"] {
+		t.Fatalf("scoped models must survive a restart: %v %v", c.scoped, err)
+	}
+}
+
+func TestModelKey(t *testing.T) {
+	for in, want := range map[string]string{"claude-fable-5-1[1m]": "claude-fable-5-1", " Claude-Opus-5-5(high) ": "claude-opus-5-5", "gpt-6-astra": "gpt-6-astra"} {
+		if got := modelKey(in); got != want {
+			t.Fatalf("modelKey(%q) = %q", in, got)
+		}
 	}
 }

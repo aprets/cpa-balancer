@@ -104,6 +104,7 @@ type binding struct {
 type decision struct {
 	At        time.Time          `json:"at"`
 	Provider  string             `json:"provider"`
+	Model     string             `json:"model,omitempty"`
 	SessionID string             `json:"session_id"`
 	Session   string             `json:"session"` // display form: the distinctive tail of the id
 	Kind      string             `json:"kind"`    // sticky, fork, new, none
@@ -116,11 +117,14 @@ type decision struct {
 const decisionHistory = 200
 
 type balancer struct {
-	mu        sync.Mutex
-	cfg       config
-	ttl       map[string]time.Duration
-	accounts  map[string]*account
-	bindings  map[string]*binding
+	mu       sync.Mutex
+	cfg      config
+	ttl      map[string]time.Duration
+	accounts map[string]*account
+	bindings map[string]*binding
+	// scoped records, per model, whether it counts against a model-scoped
+	// weekly limit (see quota.Scoped). Learned from response headers.
+	scoped    map[string]bool
 	decisions []decision
 	rng       *rand.Rand
 	now       func() time.Time
@@ -141,6 +145,7 @@ func newBalancer(logf func(level, msg string, fields map[string]any)) *balancer 
 		ttl:      map[string]time.Duration{},
 		accounts: map[string]*account{},
 		bindings: map[string]*binding{},
+		scoped:   map[string]bool{},
 		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 		now:      time.Now,
 		log:      logf,
@@ -225,6 +230,16 @@ func shortSession(s string) string {
 	return s
 }
 
+// modelKey normalises a model id so request and response forms match:
+// "claude-fable-5-1[1m]" and "claude-fable-5-1(high)" are the same model.
+func modelKey(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if i := strings.IndexAny(m, "[("); i >= 0 {
+		m = m[:i]
+	}
+	return strings.TrimSpace(m)
+}
+
 // pick is the scheduler hook. It always computes a decision; in shadow mode
 // it reports it and lets CPA's native selector run.
 func (b *balancer) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPickResponse {
@@ -246,7 +261,8 @@ func (b *balancer) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerP
 	parent := metaString(req.Options.Metadata, "parent_session_id")
 	ttl := b.ttlFor(provider)
 
-	d := decision{At: now, Provider: provider, SessionID: session, Session: shortSession(session), Shadow: b.cfg.shadow()}
+	model := modelKey(req.Model)
+	d := decision{At: now, Provider: provider, Model: model, SessionID: session, Session: shortSession(session), Shadow: b.cfg.shadow()}
 	if session != "" {
 		if bd := b.bindings[bindingKey(provider, session)]; bd != nil && now.Sub(bd.LastSeen) <= ttl && offered[bd.AuthID] {
 			d.Kind, d.AuthID = "sticky", bd.AuthID
@@ -258,7 +274,7 @@ func (b *balancer) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerP
 		}
 	}
 	if d.AuthID == "" {
-		d.Weights = b.weightsLocked(req.Candidates, now)
+		d.Weights = b.weightsLocked(req.Candidates, model, now)
 		d.Kind, d.AuthID = "new", b.weightedPick(d.Weights)
 		if session == "" {
 			d.Kind = "none"
@@ -280,7 +296,7 @@ func (b *balancer) recordLocked(d decision) {
 	if len(b.decisions) > decisionHistory {
 		b.decisions = b.decisions[len(b.decisions)-decisionHistory:]
 	}
-	fields := map[string]any{"provider": d.Provider, "session": d.Session, "kind": d.Kind, "auth": b.labelLocked(d.AuthID), "shadow": d.Shadow}
+	fields := map[string]any{"provider": d.Provider, "model": d.Model, "session": d.Session, "kind": d.Kind, "auth": b.labelLocked(d.AuthID), "shadow": d.Shadow}
 	if d.Weights != nil {
 		// Raw weights with k=4 are ~1e-9 and round to zero in a log line;
 		// the share each candidate had of the pick is what a reader wants.
@@ -308,7 +324,7 @@ func (b *balancer) labelLocked(id string) string {
 
 // weightsLocked scores every candidate. Unknown quota gets the median of the
 // known weights so it is neither favoured nor starved.
-func (b *balancer) weightsLocked(cands []pluginapi.SchedulerAuthCandidate, now time.Time) map[string]float64 {
+func (b *balancer) weightsLocked(cands []pluginapi.SchedulerAuthCandidate, model string, now time.Time) map[string]float64 {
 	weights := make(map[string]float64, len(cands))
 	var known []float64
 	var unknown []string
@@ -318,7 +334,7 @@ func (b *balancer) weightsLocked(cands []pluginapi.SchedulerAuthCandidate, now t
 			unknown = append(unknown, c.ID)
 			continue
 		}
-		w := b.weight(a, strings.ToLower(c.Provider), now)
+		w := b.weight(a, strings.ToLower(c.Provider), model, now)
 		weights[c.ID] = w
 		known = append(known, w)
 	}
@@ -345,9 +361,16 @@ const k = 4
 // weight implements the formula in DESIGN.md. CPA priority is not part of it:
 // the host only offers the highest-priority tier as candidates, so priority
 // is already a hard override before the plugin runs.
-func (b *balancer) weight(a *account, provider string, now time.Time) float64 {
+func (b *balancer) weight(a *account, provider, model string, now time.Time) float64 {
 	q := a.Quota
 	remaining := q.LongRemaining
+	// A model-scoped limit only binds for the models it covers. A model we
+	// have not seen a response for yet is scored on the worse of the two.
+	if q.Scoped != nil && *q.Scoped < remaining {
+		if scoped, known := b.scoped[model]; scoped || !known {
+			remaining = *q.Scoped
+		}
+	}
 	resetAt := q.LongResetAt
 	// A reset credit the plugin will redeem is a reset like any other: what is
 	// left in the window is gone at that moment, so spend it before then.
@@ -411,6 +434,16 @@ func (b *balancer) usage(rec pluginapi.UsageRecord) {
 		b.accounts[rec.AuthID] = a
 	}
 	if q := parseSignals(provider, headerSignals(rec.ResponseHeaders), now); q.Known && !q.ObservedAt.Before(a.Quota.ObservedAt) {
+		// Only an account that has a scoped limit can show that a model is
+		// outside it; on one without, every model looks unscoped.
+		if provider == "claude" && rec.Model != "" && (q.Scoped != nil || a.Quota.Scoped != nil) {
+			b.scoped[modelKey(rec.Model)] = q.Scoped != nil
+		}
+		// Responses from models outside the scoped limit do not report it.
+		// Keep the last value while it still describes the same week.
+		if q.Scoped == nil && q.LongResetAt.Equal(a.Quota.LongResetAt) {
+			q.Scoped = a.Quota.Scoped
+		}
 		a.Quota = q
 		b.dirty = true
 	}
@@ -547,6 +580,7 @@ type persisted struct {
 	SavedAt  time.Time           `json:"saved_at"`
 	Accounts map[string]*account `json:"accounts"`
 	Bindings map[string]*binding `json:"bindings"`
+	Scoped   map[string]bool     `json:"scoped_models,omitempty"`
 }
 
 func (b *balancer) saveLocked() error {
@@ -562,7 +596,7 @@ func (b *balancer) saveLocked() error {
 			delete(b.bindings, key)
 		}
 	}
-	raw, err := json.Marshal(persisted{SavedAt: now, Accounts: b.accounts, Bindings: b.bindings})
+	raw, err := json.Marshal(persisted{SavedAt: now, Accounts: b.accounts, Bindings: b.bindings, Scoped: b.scoped})
 	if err != nil {
 		return err
 	}
@@ -591,16 +625,20 @@ func (b *balancer) loadLocked() error {
 	if p.Bindings != nil {
 		b.bindings = p.Bindings
 	}
+	if p.Scoped != nil {
+		b.scoped = p.Scoped
+	}
 	return nil
 }
 
 // --- inspection --------------------------------------------------------------
 
 type stateView struct {
-	Config    map[string]any `json:"config"`
-	Accounts  []accountView  `json:"accounts"`
-	Bindings  []bindingView  `json:"bindings"`
-	Decisions []decision     `json:"decisions"`
+	Config    map[string]any  `json:"config"`
+	Accounts  []accountView   `json:"accounts"`
+	Bindings  []bindingView   `json:"bindings"`
+	Decisions []decision      `json:"decisions"`
+	Scoped    map[string]bool `json:"scoped_models"`
 }
 
 type accountView struct {
@@ -628,7 +666,7 @@ func (b *balancer) state() stateView {
 	for _, a := range b.accounts {
 		av := accountView{account: *a}
 		if a.Quota.Known && !a.Disabled {
-			av.Weight = b.weight(a, a.Provider, now)
+			av.Weight = b.weight(a, a.Provider, "", now) // unknown model: the conservative score
 		}
 		v.Accounts = append(v.Accounts, av)
 	}
@@ -639,5 +677,9 @@ func (b *balancer) state() stateView {
 	}
 	sort.Slice(v.Bindings, func(i, j int) bool { return v.Bindings[i].Seen.After(v.Bindings[j].Seen) })
 	v.Decisions = append([]decision(nil), b.decisions...)
+	v.Scoped = map[string]bool{}
+	for m, s := range b.scoped {
+		v.Scoped[m] = s
+	}
 	return v
 }

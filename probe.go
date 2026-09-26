@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -182,42 +183,43 @@ func parseClaudeUsage(body []byte, now time.Time) (quota, error) {
 	if !ok {
 		return quota{}, errors.New("no seven_day in usage response")
 	}
-	util := *weekly.Utilization
-	// Model-specific weekly buckets (seven_day_opus etc.) bind before the
-	// shared one when they exist; the worse of them is what we can spend.
-	for key := range resp {
-		if strings.HasPrefix(key, "seven_day_") {
-			if b, ok := get(key); ok && *b.Utilization > util {
-				util = *b.Utilization
-			}
-		}
-	}
-	q := quota{Known: true, LongRemaining: clamp01(1 - util/100), ObservedAt: now}
+	q := quota{Known: true, LongRemaining: clamp01(1 - *weekly.Utilization/100), ObservedAt: now}
 	if t, err := time.Parse(time.RFC3339Nano, weekly.ResetsAt); err == nil {
 		q.LongResetAt = t.UTC()
 	}
 	if five, ok := get("five_hour"); ok {
 		q.ShortUtil = clamp01(*five.Utilization / 100)
 	}
-	// limits[] carries the model-scoped weekly limit (weekly_scoped, e.g. the
-	// Fable bucket) which is what actually binds and what the response header
-	// 7d_oi reports. It is not in any seven_day_* key, so read it here.
+	// Model-scoped weekly limits (the Fable limit) only bind for the models
+	// they cover, so they are kept apart from the shared weekly. They appear as
+	// seven_day_<model> keys or as non-"weekly_all" entries in limits[].
+	scoped := func(used float64) {
+		if r := clamp01(1 - used); q.Scoped == nil || r < *q.Scoped {
+			q.Scoped = &r
+		}
+	}
+	for key := range resp {
+		if strings.HasPrefix(key, "seven_day_") {
+			if b, ok := get(key); ok {
+				scoped(*b.Utilization / 100)
+			}
+		}
+	}
 	if raw, ok := resp["limits"]; ok {
 		var limits []struct {
+			Kind    string  `json:"kind"`
 			Group   string  `json:"group"`
 			Percent float64 `json:"percent"`
 		}
 		if json.Unmarshal(raw, &limits) == nil {
 			for _, l := range limits {
-				switch l.Group {
-				case "weekly":
-					if l.Percent/100 > 1-q.LongRemaining {
-						q.LongRemaining = clamp01(1 - l.Percent/100)
-					}
-				case "session":
-					if l.Percent/100 > q.ShortUtil {
-						q.ShortUtil = clamp01(l.Percent / 100)
-					}
+				switch {
+				case l.Group == "weekly" && l.Kind == "weekly_all":
+					q.LongRemaining = math.Min(q.LongRemaining, clamp01(1-l.Percent/100))
+				case l.Group == "weekly":
+					scoped(l.Percent / 100)
+				case l.Group == "session":
+					q.ShortUtil = math.Max(q.ShortUtil, clamp01(l.Percent/100))
 				}
 			}
 		}
