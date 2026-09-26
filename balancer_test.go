@@ -424,7 +424,8 @@ func TestProbeStaleAccountsThroughStubbedUpstream(t *testing.T) {
 	b.http = &http.Client{Transport: rewriteTo(srv.URL)}
 	b.accounts["cx"] = &account{ID: "cx", AuthIndex: "1", Provider: "codex"}
 	b.accounts["cl"] = &account{ID: "cl", AuthIndex: "2", Provider: "claude"}
-	b.accounts["fresh"] = &account{ID: "fresh", AuthIndex: "3", Provider: "claude", Quota: quota{Known: true, ObservedAt: t0.Add(-time.Minute)}}
+	scoped := 0.5 // a fresh account whose scoped limit is known: no probe
+	b.accounts["fresh"] = &account{ID: "fresh", AuthIndex: "3", Provider: "claude", Quota: quota{Known: true, ObservedAt: t0.Add(-time.Minute), Scoped: &scoped}}
 	b.accounts["off"] = &account{ID: "off", AuthIndex: "4", Provider: "claude", Disabled: true}
 
 	b.probeStale()
@@ -538,5 +539,21 @@ func TestModelKey(t *testing.T) {
 		if got := modelKey(in); got != want {
 			t.Fatalf("modelKey(%q) = %q", in, got)
 		}
+	}
+}
+
+// A busy Claude account is never stale, so without this it would wait for a
+// Fable response to learn its scoped limit. Probe it once per start instead.
+func TestProbeFreshClaudeAccountOnceWhenScopedUnknown(t *testing.T) {
+	b := newTestBalancer(t)
+	b.authJSON = func(string) ([]byte, error) { return nil, nil }
+	fresh := quota{Known: true, LongRemaining: 0.5, ObservedAt: t0}
+	b.accounts["cl"] = &account{ID: "cl", AuthIndex: "1", Provider: "claude", Quota: fresh}
+	b.accounts["cx"] = &account{ID: "cx", AuthIndex: "2", Provider: "codex", Quota: fresh}
+	if due := b.probeDueLocked(t0); len(due) != 1 || due[0].authID != "cl" {
+		t.Fatalf("want one probe of the claude account, got %+v", due)
+	}
+	if due := b.probeDueLocked(t0.Add(30 * time.Minute)); len(due) != 0 {
+		t.Fatalf("must probe only once per start, got %+v", due)
 	}
 }

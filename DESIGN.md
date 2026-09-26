@@ -130,6 +130,8 @@ limit can mark a model unscoped. A model with no response yet is rated on the
 worse of the two limits, the old behaviour. The map is saved with the rest of
 the state, so it is learned once, not after every restart. A response without
 `7d_oi` keeps the account's last scoped value for the same week.
+Traffic keeps busy accounts from ever going stale, so a Claude account whose
+scoped value is unknown is probed once after each start.
 
 ## Explicitly not doing
 

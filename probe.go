@@ -39,7 +39,11 @@ func (b *balancer) probeDueLocked(now time.Time) []probeTarget {
 		if a.Disabled || a.AuthIndex == "" || (a.Provider != "codex" && a.Provider != "claude") {
 			continue
 		}
-		if a.Quota.Known && now.Sub(a.Quota.ObservedAt) < stale {
+		// Once per start, probe a Claude account whose model-scoped limit is
+		// unknown: busy accounts are never stale, and only Fable responses
+		// carry that limit in headers.
+		missingScoped := a.Provider == "claude" && a.Quota.Scoped == nil && a.lastProbe.IsZero()
+		if a.Quota.Known && now.Sub(a.Quota.ObservedAt) < stale && !missingScoped {
 			continue
 		}
 		if !a.lastProbe.IsZero() && now.Sub(a.lastProbe) < probeMinGap {
