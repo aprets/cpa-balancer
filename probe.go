@@ -43,7 +43,13 @@ func (b *balancer) probeDueLocked(now time.Time) []probeTarget {
 		// unknown: busy accounts are never stale, and only Fable responses
 		// carry that limit in headers.
 		missingScoped := a.Provider == "claude" && a.Quota.Scoped == nil && a.lastProbe.IsZero()
-		if a.Quota.Known && now.Sub(a.Quota.ObservedAt) < stale && !missingScoped {
+		fresh := a.Quota.Known && now.Sub(a.Quota.ObservedAt) < stale && !missingScoped
+		// While CPA holds an account after a 429, re-read it every probeMinGap
+		// so it comes back soon after its quota does. See recover.go.
+		if b.recoverableLocked(a, now) {
+			fresh = a.Quota.ObservedAt.After(a.lastErrorAt) && now.Sub(a.Quota.ObservedAt) < probeMinGap
+		}
+		if fresh {
 			continue
 		}
 		if !a.lastProbe.IsZero() && now.Sub(a.lastProbe) < probeMinGap {

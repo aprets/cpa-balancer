@@ -74,7 +74,8 @@ fails. We want something small we fully understand.
    `anthropic-ratelimit-unified-*` headers reach the plugin through the usage
    hook. Nothing is polled: the management API is not used at all, and the
    host's in-process `host.auth.list` callback is the only source of account
-   identity (id, auth index, label, disabled). An account nothing has observed for `probe_stale_minutes` (default 60),
+   identity (id, auth index, label, disabled) and of CPA's own holds (see
+   "Bringing back benched accounts"). An account nothing has observed for `probe_stale_minutes` (default 60),
    including one that has never had traffic, gets one GET to the upstream
    usage endpoint with its own OAuth token (`chatgpt.com/backend-api/wham/usage`,
    `api.anthropic.com/api/oauth/usage`). Tokens come from `host.auth.get` so
@@ -133,6 +134,47 @@ the state, so it is learned once, not after every restart. A response without
 Traffic keeps busy accounts from ever going stale, so a Claude account whose
 scoped value is unknown is probed once after each start.
 
+## Bringing back benched accounts
+
+CPA benches an account after a 429 until the limit's reset, which it reads
+from the response: for a weekly limit that is days away. Nothing in CPA looks
+again before then. Only a toggle, a restart or the management API's cooldown
+reset clears it. So quota that returns sooner sits unused: a redeemed reset, a
+window that rolled over, a wrong deadline. On 2026-10-11 two Claude accounts
+were redeemed after their weekly 429 and stayed out with full quota until
+someone toggled them.
+
+Every minute the plugin reads CPA's hold on each account from
+`host.auth.list` (`unavailable`, `next_retry_after`). An account qualifies
+when its latest attempt failed with a 429 (from the usage hook), CPA holds it
+for more than another 10 minutes (shorter holds end on their own before the
+next probe), and it isn't disabled. A qualifying account is probed every 10
+minutes. When a probe taken after the 429 shows at least 2% left in every
+window it reports (weekly, 5h, and the scoped weekly if there is one), the
+plugin calls `host.routing.reset_cooldown` (CPA v8.0.12+). That is the same
+reset as the management API's `routing/cooldown/reset`, and the account is a
+candidate again on the next request.
+
+What it leaves alone:
+
+- Any other failure. A 401, 402 or 403 is a dead login that needs a person.
+  Clearing it would mark it active and hide it from whatever watches for
+  dead logins. CPA's reset refuses a terminally unauthorized login anyway.
+- An account whose probe fails, which is what an expired token looks like.
+- A recovery that didn't stick. If the reset call fails, or the account gets
+  another 429 before it serves anything, the plugin leaves it to CPA until
+  CPA lists it as available again.
+
+Each recovery and each failed recovery is logged, and posted as one line to
+Telegram when `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set in CPA's
+environment. `recover: false` turns recovery off.
+
+The host reports holds per account, not per model. A Codex 429 benches only
+the model that hit it, so while the account's other models are clean CPA
+lists it as available and the plugin can't see the hold. It shows once every
+model the account has served is benched. A CPA restart clears every hold
+unless `save-cooldown-status` is on.
+
 ## Explicitly not doing
 
 - Any UI.
@@ -170,6 +212,8 @@ scoped value is unknown is probed once after each start.
 | `horizon_hours.codex` | 6 | cost of a forced move is reasoning for the binding |
 | `k` (constant) | 4 | simulation below: best reserve without exhaustion events. Codex accounts reset together so k barely matters there; watch it if they drift apart |
 | `probe_stale_minutes` | 60 | idle accounts get one direct usage pull per hour |
+| `recover` | true | a 429 hold outlives the quota it protected, see "Bringing back benched accounts" |
+| room to recover (constant) | 2% | keeps an account at the edge of its limit from coming back for one more 429 |
 
 ## How k and horizon were chosen (2026-09-15)
 

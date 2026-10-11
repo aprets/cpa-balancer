@@ -33,7 +33,12 @@ plugins:
       horizon_hours: { claude: 2, codex: 6 } # how far ahead a placement draws
       state_file: /CLIProxyAPI/plugins/cpa-balancer.state.json
       redeem_lead_minutes: 15      # redeem Codex reset credits this close to expiry (redeem: false to stop)
+      recover: true                # clear CPA's 429 cooldown once a probe shows the quota is back
 ```
+
+Recovery notices go to Telegram when `TELEGRAM_BOT_TOKEN` and
+`TELEGRAM_CHAT_ID` are set in CPA's environment. Recovery needs CPA v8.0.12 or
+later.
 
 Inspect it with:
 
