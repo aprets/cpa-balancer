@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 var t0 = time.Date(2026, 9, 14, 19, 0, 0, 0, time.UTC)
