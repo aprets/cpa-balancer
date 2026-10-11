@@ -19,7 +19,10 @@ const (
 	codexUsageURL  = "https://chatgpt.com/backend-api/wham/usage"
 	claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
 	probeMinGap    = 10 * time.Minute // per account, also after failures
+	probePauseFor  = time.Hour        // after the usage endpoint answers 429
 )
+
+var errUsageLimited = errors.New("usage endpoint returned 429")
 
 type probeTarget struct {
 	authID    string
@@ -36,7 +39,7 @@ func (b *balancer) probeDueLocked(now time.Time) []probeTarget {
 	stale := time.Duration(b.cfg.ProbeStaleMinutes) * time.Minute
 	var due []probeTarget
 	for _, a := range b.accounts {
-		if a.Disabled || a.AuthIndex == "" || (a.Provider != "codex" && a.Provider != "claude") {
+		if a.Disabled || a.AuthIndex == "" || (a.Provider != "codex" && a.Provider != "claude") || now.Before(a.probePause) {
 			continue
 		}
 		// Once per start, probe a Claude account whose model-scoped limit is
@@ -44,10 +47,10 @@ func (b *balancer) probeDueLocked(now time.Time) []probeTarget {
 		// carry that limit in headers.
 		missingScoped := a.Provider == "claude" && a.Quota.Scoped == nil && a.lastProbe.IsZero()
 		fresh := a.Quota.Known && now.Sub(a.Quota.ObservedAt) < stale && !missingScoped
-		// While CPA holds an account after a 429, re-read it every probeMinGap
+		// While CPA holds an account after a 429, re-read it every heldProbeGap
 		// so it comes back soon after its quota does. See recover.go.
 		if b.recoverableLocked(a, now) {
-			fresh = a.Quota.ObservedAt.After(a.lastErrorAt) && now.Sub(a.Quota.ObservedAt) < probeMinGap
+			fresh = a.Quota.ObservedAt.After(a.lastErrorAt) && now.Sub(a.Quota.ObservedAt) < heldProbeGap
 		}
 		if fresh {
 			continue
@@ -109,6 +112,9 @@ func (b *balancer) probe(t probeTarget, now time.Time) (quota, error) {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return quota{}, err
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return quota{}, errUsageLimited
 	}
 	if resp.StatusCode != http.StatusOK {
 		return quota{}, fmt.Errorf("usage endpoint returned %d", resp.StatusCode)

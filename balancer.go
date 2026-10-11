@@ -106,8 +106,9 @@ type account struct {
 	heldUntil    time.Time
 	lastError    int
 	lastErrorAt  time.Time
-	recoveredAt  time.Time // when the plugin last cleared CPA's hold, until a response succeeds
+	recoveredAt  time.Time // when the plugin last cleared CPA's hold
 	skipRecovery bool      // a recovery failed: leave the account to CPA until it is next seen available
+	probePause   time.Time // no probe before this: the usage endpoint answered 429
 }
 
 type binding struct {
@@ -455,13 +456,17 @@ func (b *balancer) usage(rec pluginapi.UsageRecord) {
 		b.accounts[rec.AuthID] = a
 	}
 	if !rec.Failed {
-		a.lastError, a.recoveredAt = 0, time.Time{}
+		// A stream sent before the 429 can finish after it; it says nothing
+		// about the hold.
+		if rec.RequestedAt.After(a.lastErrorAt) {
+			a.lastError = 0
+		}
 	} else {
 		a.lastError, a.lastErrorAt = rec.Failure.StatusCode, now
-		if a.lastError == http.StatusTooManyRequests && !a.recoveredAt.IsZero() {
+		if a.lastError == http.StatusTooManyRequests && !a.recoveredAt.IsZero() && now.Sub(a.recoveredAt) < recoverStickFor {
 			a.recoveredAt, a.skipRecovery = time.Time{}, true
 			b.log("warn", "cpa-balancer: recovery did not stick", map[string]any{"auth": b.labelLocked(a.ID), "provider": provider})
-			b.notes = append(b.notes, fmt.Sprintf("CPA: %s (%s) hit a 429 again before serving anything after it was brought back. Leaving it to CPA.", b.labelLocked(a.ID), provider))
+			b.notes = append(b.notes, fmt.Sprintf("CPA: %s (%s) hit a 429 again within an hour of being brought back. Leaving it to CPA.", b.labelLocked(a.ID), provider))
 		}
 	}
 	if q := parseSignals(provider, headerSignals(rec.ResponseHeaders), now); q.Known && !q.ObservedAt.Before(a.Quota.ObservedAt) {
@@ -603,7 +608,12 @@ func (b *balancer) probeStale() {
 		b.mu.Lock()
 		a := b.accounts[t.authID]
 		if err != nil {
-			b.log("warn", "cpa-balancer: probe failed", map[string]any{"auth": b.labelLocked(t.authID), "provider": t.provider, "error": err.Error()})
+			fields := map[string]any{"auth": b.labelLocked(t.authID), "provider": t.provider, "error": err.Error()}
+			if a != nil && errors.Is(err, errUsageLimited) {
+				a.probePause = now.Add(probePauseFor)
+				fields["paused_until"] = a.probePause.UTC().Format(time.RFC3339)
+			}
+			b.log("warn", "cpa-balancer: probe failed", fields)
 		} else if a != nil && !q.ObservedAt.Before(a.Quota.ObservedAt) {
 			a.Quota = q
 			b.dirty = true
