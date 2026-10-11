@@ -20,19 +20,27 @@ import (
 // 401, 402 or 403 from a dead login included, is left alone, so it stays
 // visible as broken in CPA and in Keeper.
 
-// recoverMinRoom is how much every window must have left before a hold is
-// cleared, so an account at the edge of its limit isn't put back for one more
-// 429.
-const recoverMinRoom = 0.02
+const (
+	// recoverMinRoom is how much every window must have left before a hold is
+	// cleared, so an account at the edge of its limit isn't put back for one
+	// more 429.
+	recoverMinRoom = 0.02
+	// heldProbeGap is how often a held account is re-probed. The usage
+	// endpoint answers 429 itself when it is polled too often.
+	heldProbeGap = 30 * time.Minute
+	// recoverStickFor: a 429 this soon after a recovery means it didn't stick,
+	// even if requests succeeded in between.
+	recoverStickFor = time.Hour
+)
 
 const telegramURL = "https://api.telegram.org/bot"
 
 // recoverableLocked reports whether CPA is holding the account after a 429
-// for longer than the next probe would take. Shorter holds end on their own.
+// for longer than heldProbeGap. Shorter holds end on their own.
 // Caller holds the lock.
 func (b *balancer) recoverableLocked(a *account, now time.Time) bool {
 	return b.cfg.recovery() && b.resetCooldown != nil && !a.Disabled && !a.skipRecovery &&
-		a.lastError == http.StatusTooManyRequests && a.heldUntil.Sub(now) > probeMinGap
+		a.lastError == http.StatusTooManyRequests && a.heldUntil.Sub(now) > heldProbeGap
 }
 
 // hasRoom reports whether every window the account reports has room left.

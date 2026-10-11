@@ -147,9 +147,13 @@ someone toggled them.
 Every minute the plugin reads CPA's hold on each account from
 `host.auth.list` (`unavailable`, `next_retry_after`). An account qualifies
 when its latest attempt failed with a 429 (from the usage hook), CPA holds it
-for more than another 10 minutes (shorter holds end on their own before the
-next probe), and it isn't disabled. A qualifying account is probed every 10
-minutes. When a probe taken after the 429 shows at least 2% left in every
+for more than another 30 minutes (shorter holds end on their own before the
+next probe), and it isn't disabled. A response to a request sent before the
+429 doesn't count as a later success: streams overlap, and one that finishes
+after the 429 says nothing about the hold. A qualifying account is probed
+every 30 minutes. The usage endpoint answers 429 itself when it is polled too
+often; after that, the plugin leaves the account's probes alone for an hour.
+When a probe taken after the 429 shows at least 2% left in every
 window it reports (weekly, 5h, and the scoped weekly if there is one), the
 plugin calls `host.routing.reset_cooldown` (CPA v8.0.12+). That is the same
 reset as the management API's `routing/cooldown/reset`, and the account is a
@@ -162,18 +166,22 @@ What it leaves alone:
   dead logins. CPA's reset refuses a terminally unauthorized login anyway.
 - An account whose probe fails, which is what an expired token looks like.
 - A recovery that didn't stick. If the reset call fails, or the account gets
-  another 429 before it serves anything, the plugin leaves it to CPA until
-  CPA lists it as available again.
+  another 429 within an hour of being brought back, the plugin leaves it to
+  CPA until CPA lists it as available again. Successes in between don't
+  matter: if the usage endpoint shows room but Anthropic keeps refusing, the
+  plugin would otherwise cycle through recover, success and 429.
 
 Each recovery and each failed recovery is logged, and posted as one line to
 Telegram when `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set in CPA's
 environment. `recover: false` turns recovery off.
 
-The host reports holds per account, not per model. A Codex 429 benches only
-the model that hit it, so while the account's other models are clean CPA
-lists it as available and the plugin can't see the hold. It shows once every
-model the account has served is benched. A CPA restart clears every hold
-unless `save-cooldown-status` is on.
+The host reports holds per account, not per model. CPA benches the whole
+account for a quota 429 from either provider: a rejected Claude 5h or weekly
+window, and Codex `usage_limit_reached`. So both show up and both recover.
+With CPA's `model-level-cooling` on for a provider, only the model that hit
+the limit is benched instead. The plugin then sees the hold only once every
+model the account serves is benched. A CPA restart clears every hold unless
+`save-cooldown-status` is on.
 
 ## Explicitly not doing
 
@@ -214,6 +222,7 @@ unless `save-cooldown-status` is on.
 | `probe_stale_minutes` | 60 | idle accounts get one direct usage pull per hour |
 | `recover` | true | a 429 hold outlives the quota it protected, see "Bringing back benched accounts" |
 | room to recover (constant) | 2% | keeps an account at the edge of its limit from coming back for one more 429 |
+| held probe gap (constant) | 30 min | the usage endpoint 429s when polled too often; a pause of an hour follows one |
 
 ## How k and horizon were chosen (2026-09-15)
 

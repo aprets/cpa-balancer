@@ -20,6 +20,7 @@ type usageStub struct {
 	weekly, fiveHour      float64
 	scoped                float64 // seven_day_fable utilisation, -1 for none
 	status                int     // usage endpoint status, 0 for 200
+	probes                int     // usage endpoint hits
 	sent                  []string
 	weeklyReset, fiveSoon string
 }
@@ -34,8 +35,13 @@ func newUsageStub(t *testing.T) (*usageStub, *httptest.Server) {
 			s.sent = append(s.sent, r.PostForm.Get("text"))
 			return
 		}
+		s.probes++
 		if s.status != 0 {
 			w.WriteHeader(s.status)
+			return
+		}
+		if strings.Contains(r.URL.Path, "wham") { // Codex: weekly window only
+			fmt.Fprintf(w, `{"rate_limit":{"primary_window":{"used_percent":%g,"limit_window_seconds":604800,"reset_at":1789805965}}}`, s.weekly)
 			return
 		}
 		body := fmt.Sprintf(`{"five_hour":{"utilization":%g,"resets_at":%q},"seven_day":{"utilization":%g,"resets_at":%q}`, s.fiveHour, s.fiveSoon, s.weekly, s.weeklyReset)
@@ -52,6 +58,12 @@ func (s *usageStub) set(f func(s *usageStub)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	f(s)
+}
+
+func (s *usageStub) probeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.probes
 }
 
 func (s *usageStub) messages() []string {
@@ -98,8 +110,11 @@ func (r *recoveryRig) at(offset time.Duration) {
 	r.b.flushNotes()
 }
 
-func (r *recoveryRig) result(status int) {
-	r.b.usage(pluginapi.UsageRecord{AuthID: "cl", Provider: "claude", Failed: status != 0, Failure: pluginapi.UsageFailure{StatusCode: status}})
+// result reports one attempt on the rig's account, sent and finished now.
+func (r *recoveryRig) result(status int) { r.resultSentAt(status, r.b.now()) }
+
+func (r *recoveryRig) resultSentAt(status int, sent time.Time) {
+	r.b.usage(pluginapi.UsageRecord{AuthID: r.entry.ID, Provider: r.entry.Provider, RequestedAt: sent, Failed: status != 0, Failure: pluginapi.UsageFailure{StatusCode: status}})
 }
 
 // The 11 Oct incident: a weekly 429, then a redeemed reset. CPA keeps the
@@ -109,18 +124,18 @@ func TestRecoversHeldAccountOnceQuotaIsBack(t *testing.T) {
 	r := newRecoveryRig(t)
 	r.result(http.StatusTooManyRequests)
 
-	r.at(0) // first probe after the 429: still exhausted
+	r.at(time.Minute) // first probe after the 429: still exhausted
 	r.at(5 * time.Minute)
 	if len(r.resets) != 0 || len(r.stub.messages()) != 0 {
 		t.Fatalf("exhausted account must stay held: resets %v, sent %v", r.resets, r.stub.messages())
 	}
 
 	r.stub.set(func(s *usageStub) { s.weekly, s.weeklyReset = 0, "2026-09-21T09:40:00Z" }) // redeemed
-	r.at(9 * time.Minute)
+	r.at(30 * time.Minute)
 	if len(r.resets) != 0 {
-		t.Fatal("probes are at least probeMinGap apart")
+		t.Fatal("held accounts are probed every heldProbeGap")
 	}
-	r.at(11 * time.Minute)
+	r.at(32 * time.Minute)
 	if len(r.resets) != 1 || r.resets[0] != "7" {
 		t.Fatalf("resets = %v, want one for auth index 7", r.resets)
 	}
@@ -130,7 +145,7 @@ func TestRecoversHeldAccountOnceQuotaIsBack(t *testing.T) {
 	}
 
 	r.result(0) // it serves again
-	r.at(12 * time.Minute)
+	r.at(33 * time.Minute)
 	if len(r.resets) != 1 || len(r.stub.messages()) != 1 {
 		t.Fatalf("a recovered account needs nothing more: resets %v, sent %v", r.resets, r.stub.messages())
 	}
@@ -148,7 +163,7 @@ func TestRecoveryLeavesOtherHoldsAlone(t *testing.T) {
 		{"payment required", func(r *recoveryRig) { r.result(http.StatusPaymentRequired) }},
 		{"hold ends before the next probe", func(r *recoveryRig) {
 			r.result(http.StatusTooManyRequests)
-			r.entry.NextRetryAfter = t0.Add(5 * time.Minute)
+			r.entry.NextRetryAfter = t0.Add(20 * time.Minute)
 		}},
 		{"disabled", func(r *recoveryRig) { r.result(http.StatusTooManyRequests); r.entry.Disabled = true }},
 		{"weekly nearly spent", func(r *recoveryRig) { r.result(http.StatusTooManyRequests); r.stub.weekly = 99 }},
@@ -171,8 +186,8 @@ func TestRecoveryLeavesOtherHoldsAlone(t *testing.T) {
 			r := newRecoveryRig(t)
 			r.stub.weekly = 0
 			c.setup(r)
-			r.at(0)
-			r.at(11 * time.Minute)
+			r.at(time.Minute)
+			r.at(32 * time.Minute)
 			if len(r.resets) != 0 || len(r.stub.messages()) != 0 {
 				t.Fatalf("resets %v, sent %v; want none", r.resets, r.stub.messages())
 			}
@@ -204,7 +219,7 @@ func TestFailedRecoveryHandsTheAccountBackToCPA(t *testing.T) {
 			t.Fatalf("a new hold is recoverable again, resets = %v", r.resets)
 		}
 	})
-	t.Run("429 again straight after", func(t *testing.T) {
+	t.Run("429 again within the hour", func(t *testing.T) {
 		r := newRecoveryRig(t)
 		r.stub.weekly = 0
 		r.result(http.StatusTooManyRequests)
@@ -212,15 +227,103 @@ func TestFailedRecoveryHandsTheAccountBackToCPA(t *testing.T) {
 		if len(r.resets) != 1 {
 			t.Fatalf("resets = %v", r.resets)
 		}
+		// The usage endpoint keeps showing room while Anthropic keeps
+		// answering 429: one success, then the limit again.
+		r.result(0)
+		r.b.now = func() time.Time { return t0.Add(40 * time.Minute) }
 		r.result(http.StatusTooManyRequests)
 		r.entry.Unavailable, r.entry.NextRetryAfter = true, t0.Add(61*time.Hour)
-		r.at(2 * time.Minute)
-		r.at(20 * time.Minute)
+		for m := 41; m <= 180; m += 10 {
+			r.at(time.Duration(m) * time.Minute)
+		}
 		sent := r.stub.messages()
-		if len(r.resets) != 1 || len(sent) != 2 || !strings.Contains(sent[1], "hit a 429 again") {
+		if len(r.resets) != 1 || len(sent) != 2 || !strings.Contains(sent[1], "hit a 429 again within an hour") {
 			t.Fatalf("resets %v, telegram %q", r.resets, sent)
 		}
 	})
+	t.Run("429 after the hour is a new hold", func(t *testing.T) {
+		r := newRecoveryRig(t)
+		r.stub.weekly = 0
+		r.result(http.StatusTooManyRequests)
+		r.at(time.Minute)
+		r.result(0)
+		r.b.now = func() time.Time { return t0.Add(2 * time.Hour) }
+		r.result(http.StatusTooManyRequests)
+		r.entry.Unavailable, r.entry.NextRetryAfter = true, t0.Add(61*time.Hour)
+		r.at(2*time.Hour + time.Minute)
+		if sent := r.stub.messages(); len(r.resets) != 2 || len(sent) != 2 || strings.Contains(sent[1], "again") {
+			t.Fatalf("resets %v, telegram %q", r.resets, sent)
+		}
+	})
+}
+
+// A stream sent before the 429 that finishes after it must not make the
+// account look healthy, or the hold is never cleared.
+func TestSuccessSentBeforeThe429KeepsTheHoldRecoverable(t *testing.T) {
+	r := newRecoveryRig(t)
+	r.stub.weekly = 0
+	r.b.now = func() time.Time { return t0.Add(time.Minute) }
+	r.result(http.StatusTooManyRequests)
+	r.b.now = func() time.Time { return t0.Add(2 * time.Minute) }
+	r.resultSentAt(0, t0) // started before the 429, finished after
+	r.at(3 * time.Minute)
+	if len(r.resets) != 1 {
+		t.Fatalf("resets = %v, want the hold cleared", r.resets)
+	}
+
+	r = newRecoveryRig(t)
+	r.stub.weekly = 0
+	r.b.now = func() time.Time { return t0.Add(time.Minute) }
+	r.result(http.StatusTooManyRequests)
+	r.b.now = func() time.Time { return t0.Add(2 * time.Minute) }
+	r.result(0) // sent after the 429: the account works
+	if v := r.b.state().Accounts[0]; v.LastError != 0 {
+		t.Fatalf("last error = %d, want cleared by a later request", v.LastError)
+	}
+}
+
+func TestHeldAccountProbesAreSpacedAndPauseAfterUsage429(t *testing.T) {
+	r := newRecoveryRig(t) // stays exhausted throughout
+	r.result(http.StatusTooManyRequests)
+	want := func(at time.Duration, probes int) {
+		t.Helper()
+		r.at(at)
+		if got := r.stub.probeCount(); got != probes {
+			t.Fatalf("at +%v: %d probes, want %d", at, got, probes)
+		}
+	}
+	want(time.Minute, 1) // first probe after the 429
+	want(11*time.Minute, 1)
+	want(30*time.Minute, 1)
+	want(32*time.Minute, 2) // heldProbeGap later
+	r.stub.set(func(s *usageStub) { s.status = http.StatusTooManyRequests })
+	want(63*time.Minute, 3) // answered 429: pause an hour
+	want(93*time.Minute, 3)
+	want(122*time.Minute, 3)
+	r.stub.set(func(s *usageStub) { s.status = 0 })
+	want(124*time.Minute, 4)
+	if len(r.resets) != 0 {
+		t.Fatalf("resets = %v", r.resets)
+	}
+}
+
+// Codex usage_limit_reached benches the whole account (CPA sets it
+// credential-scoped unless codex.model-level-cooling is on), so the host
+// lists the hold and recovery works the same way.
+func TestRecoversHeldCodexAccount(t *testing.T) {
+	r := newRecoveryRig(t)
+	r.entry.ID, r.entry.AuthIndex, r.entry.Provider, r.entry.Email = "cx", "9", "codex", "codex@example.com"
+	r.result(http.StatusTooManyRequests)
+	r.at(time.Minute)
+	if len(r.resets) != 0 {
+		t.Fatalf("exhausted Codex account must stay held, resets = %v", r.resets)
+	}
+	r.stub.set(func(s *usageStub) { s.weekly = 0 }) // reset credit redeemed
+	r.at(32 * time.Minute)
+	sent := r.stub.messages()
+	if len(r.resets) != 1 || r.resets[0] != "9" || len(sent) != 1 || !strings.HasSuffix(sent[0], "brought back codex@example.com (codex), held after a 429 until "+localTime(t0.Add(61*time.Hour))+". Now 0% of the week used.") {
+		t.Fatalf("resets %v, telegram %q", r.resets, sent)
+	}
 }
 
 type failingTransport struct{}
