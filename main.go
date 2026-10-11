@@ -61,6 +61,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"unsafe"
 
@@ -74,7 +75,10 @@ const pluginVersion = "0.1.0"
 
 var bal = newBalancer(hostLog)
 
-func init() { bal.authJSON, bal.authList = hostAuthJSON, hostAuthList }
+func init() {
+	bal.authJSON, bal.authList, bal.resetCooldown = hostAuthJSON, hostAuthList, hostResetCooldown
+	bal.tgToken, bal.tgChat = os.Getenv("TELEGRAM_BOT_TOKEN"), os.Getenv("TELEGRAM_CHAT_ID")
+}
 
 func main() {}
 
@@ -218,6 +222,7 @@ var configFields = []pluginapi.ConfigField{
 	{Name: "probe_stale_minutes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Observation age after which an account is probed. Default 60."},
 	{Name: "redeem", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Redeem Codex reset credits shortly before they expire so they are not lost. Default true."},
 	{Name: "redeem_lead_minutes", Type: pluginapi.ConfigFieldTypeInteger, Description: "How many minutes before expiry a reset credit is redeemed. Default 15."},
+	{Name: "recover", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Clear CPA's cooldown on an account benched by a 429 once a probe shows its quota is back. Default true."},
 }
 
 func okEnvelope(v any) ([]byte, error) {
@@ -307,6 +312,14 @@ func hostAuthList() ([]pluginapi.HostAuthFileEntry, error) {
 		return nil, err
 	}
 	return resp.Files, nil
+}
+
+// hostResetCooldown clears CPA's quota and cooldown state for one account via
+// host.routing.reset_cooldown (CPA v8.0.12+). Auth files are left alone.
+func hostResetCooldown(authIndex string) error {
+	payload, _ := json.Marshal(pluginapi.HostRoutingResetCooldownRequest{AuthIndex: authIndex})
+	_, err := hostCall(pluginabi.MethodHostRoutingResetCooldown, payload)
+	return err
 }
 
 // hostLog forwards a log line to CPA's logger through the host callback.

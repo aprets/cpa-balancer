@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"net/http"
@@ -29,6 +30,9 @@ type config struct {
 	// credits.go.
 	Redeem            *bool `yaml:"redeem"`
 	RedeemLeadMinutes int   `yaml:"redeem_lead_minutes"`
+	// Recover clears CPA's hold on an account benched by a 429 once a probe
+	// shows its quota is back. See recover.go.
+	Recover *bool `yaml:"recover"`
 }
 
 // fill copies defaults for providers the config leaves unset or non-positive.
@@ -54,9 +58,10 @@ func (c config) horizonFor(provider string) float64 {
 	return 6
 }
 
-func (c config) shadow() bool { return c.Shadow == nil || *c.Shadow }
-func (c config) probe() bool  { return c.Probe == nil || *c.Probe }
-func (c config) redeem() bool { return c.Redeem == nil || *c.Redeem }
+func (c config) shadow() bool   { return c.Shadow == nil || *c.Shadow }
+func (c config) probe() bool    { return c.Probe == nil || *c.Probe }
+func (c config) redeem() bool   { return c.Redeem == nil || *c.Redeem }
+func (c config) recovery() bool { return c.Recover == nil || *c.Recover }
 
 func (c config) withDefaults() config {
 	// Horizon is where the cost of a forced move lives: an hour of cache on
@@ -94,6 +99,15 @@ type account struct {
 	lastProbe time.Time
 	Credits   []credit  `json:"credits,omitempty"` // available Codex reset credits, see credits.go
 	creditsAt time.Time // when Credits was last read
+	// heldUntil is CPA's own cooldown deadline from host.auth.list, zero when
+	// CPA isn't holding the account. lastError is the HTTP status of the
+	// account's latest attempt if it failed, 0 once one succeeds. See
+	// recover.go for the rest.
+	heldUntil    time.Time
+	lastError    int
+	lastErrorAt  time.Time
+	recoveredAt  time.Time // when the plugin last cleared CPA's hold, until a response succeeds
+	skipRecovery bool      // a recovery failed: leave the account to CPA until it is next seen available
 }
 
 type binding struct {
@@ -137,6 +151,12 @@ type balancer struct {
 	running   bool
 	stopped   bool
 	stop      chan struct{}
+
+	// resetCooldown is host.routing.reset_cooldown; nil disables recovery.
+	resetCooldown func(authIndex string) error
+	// Telegram bot and chat for recovery notices; unset sends nothing.
+	tgToken, tgChat string
+	notes           []string // notices waiting for the loop to send them
 }
 
 func newBalancer(logf func(level, msg string, fields map[string]any)) *balancer {
@@ -180,6 +200,7 @@ func (b *balancer) configure(cfg config) {
 	b.log("info", "cpa-balancer configured", map[string]any{
 		"shadow": b.cfg.shadow(), "k": k, "horizon_hours": b.cfg.HorizonHours, "ttl": b.cfg.TTL,
 		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes, "redeem": b.cfg.redeem() && b.authJSON != nil, "redeem_lead_minutes": b.cfg.RedeemLeadMinutes,
+		"recover": b.cfg.recovery() && b.resetCooldown != nil, "telegram": b.tgToken != "" && b.tgChat != "",
 		"state_file": b.cfg.StateFile, "bindings": len(b.bindings), "accounts": len(b.accounts),
 	})
 }
@@ -433,6 +454,16 @@ func (b *balancer) usage(rec pluginapi.UsageRecord) {
 		a = &account{ID: rec.AuthID, Provider: provider}
 		b.accounts[rec.AuthID] = a
 	}
+	if !rec.Failed {
+		a.lastError, a.recoveredAt = 0, time.Time{}
+	} else {
+		a.lastError, a.lastErrorAt = rec.Failure.StatusCode, now
+		if a.lastError == http.StatusTooManyRequests && !a.recoveredAt.IsZero() {
+			a.recoveredAt, a.skipRecovery = time.Time{}, true
+			b.log("warn", "cpa-balancer: recovery did not stick", map[string]any{"auth": b.labelLocked(a.ID), "provider": provider})
+			b.notes = append(b.notes, fmt.Sprintf("CPA: %s (%s) hit a 429 again before serving anything after it was brought back. Leaving it to CPA.", b.labelLocked(a.ID), provider))
+		}
+	}
 	if q := parseSignals(provider, headerSignals(rec.ResponseHeaders), now); q.Known && !q.ObservedAt.Before(a.Quota.ObservedAt) {
 		// Only an account that has a scoped limit can show that a model is
 		// outside it; on one without, every model looks unscoped.
@@ -485,7 +516,9 @@ func (b *balancer) loop() {
 		b.mu.Unlock()
 		b.refreshAccounts()
 		b.probeStale()
+		b.recoverHeld()
 		b.redeemExpiring()
+		b.flushNotes()
 		b.mu.Lock()
 		if b.dirty {
 			if err := b.saveLocked(); err != nil {
@@ -513,6 +546,7 @@ func (b *balancer) refreshAccounts() {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	now := b.now()
 	seen := map[string]bool{}
 	for _, f := range files {
 		if f.ID == "" || f.AuthIndex == "" {
@@ -530,6 +564,11 @@ func (b *balancer) refreshAccounts() {
 			b.dirty = true
 		}
 		a.Provider, a.AuthIndex, a.Priority, a.Disabled = provider, f.AuthIndex, f.Priority, f.Disabled
+		if f.Unavailable && f.NextRetryAfter.After(now) {
+			a.heldUntil = f.NextRetryAfter
+		} else {
+			a.heldUntil, a.skipRecovery = time.Time{}, false
+		}
 		switch {
 		case f.Email != "":
 			a.Label = f.Email
@@ -643,7 +682,9 @@ type stateView struct {
 
 type accountView struct {
 	account
-	Weight float64 `json:"weight"`
+	Weight    float64   `json:"weight"`
+	HeldUntil time.Time `json:"held_until,omitzero"` // CPA's cooldown deadline
+	LastError int       `json:"last_error,omitzero"` // status of the latest attempt, if it failed
 }
 
 type bindingView struct {
@@ -662,9 +703,10 @@ func (b *balancer) state() stateView {
 		"shadow": b.cfg.shadow(), "k": k, "horizon_hours": b.cfg.HorizonHours,
 		"ttl": b.cfg.TTL, "state_file": b.cfg.StateFile,
 		"probe": b.cfg.probe() && b.authJSON != nil, "probe_stale_minutes": b.cfg.ProbeStaleMinutes, "redeem": b.cfg.redeem() && b.authJSON != nil, "redeem_lead_minutes": b.cfg.RedeemLeadMinutes,
+		"recover": b.cfg.recovery() && b.resetCooldown != nil,
 	}}
 	for _, a := range b.accounts {
-		av := accountView{account: *a}
+		av := accountView{account: *a, HeldUntil: a.heldUntil, LastError: a.lastError}
 		if a.Quota.Known && !a.Disabled {
 			av.Weight = b.weight(a, a.Provider, "", now) // unknown model: the conservative score
 		}
