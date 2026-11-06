@@ -609,8 +609,9 @@ func (b *balancer) probeStale() {
 		a := b.accounts[t.authID]
 		if err != nil {
 			fields := map[string]any{"auth": b.labelLocked(t.authID), "provider": t.provider, "error": err.Error()}
-			if a != nil && errors.Is(err, errUsageLimited) {
-				a.probePause = now.Add(probePauseFor)
+			// From when this answer came, not when the batch began: earlier probes take time.
+			if pause := pauseAfter(err); a != nil && pause > 0 {
+				a.probePause = b.now().Add(pause)
 				fields["paused_until"] = a.probePause.UTC().Format(time.RFC3339)
 			}
 			b.log("warn", "cpa-balancer: probe failed", fields)
