@@ -21,6 +21,7 @@ const (
 	claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
 	probeMinGap    = 10 * time.Minute // per account, also after failures
 	probePauseFor  = time.Hour        // after the usage endpoint answers 429
+	probePauseMax  = 24 * time.Hour   // the most a Retry-After can stretch that pause
 )
 
 // usageLimited is the usage endpoint's 429, with its Retry-After if it sent one.
@@ -29,23 +30,32 @@ type usageLimited struct{ retryAfter time.Duration }
 func (usageLimited) Error() string { return "usage endpoint returned 429" }
 
 // pauseAfter is how long an account's probes stop after err: zero unless the
-// usage endpoint answered 429, then an hour or its Retry-After if longer.
+// usage endpoint answered 429, then an hour or its Retry-After if longer, at
+// most a day, so a broken header can't keep a held account from recovering.
 func pauseAfter(err error) time.Duration {
 	var limited usageLimited
 	if !errors.As(err, &limited) {
 		return 0
 	}
-	return max(probePauseFor, limited.retryAfter)
+	return min(max(probePauseFor, limited.retryAfter), probePauseMax)
 }
 
-// retryAfter reads a Retry-After header: delay seconds or an HTTP date.
+// retryAfter reads a Retry-After header, delay seconds or an HTTP date, capped
+// at probePauseMax. Seconds are compared before they're multiplied, so a huge
+// value can't wrap round to a short or negative duration.
 func retryAfter(v string, now time.Time) time.Duration {
 	v = strings.TrimSpace(v)
-	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil || errors.Is(err, strconv.ErrRange) {
+		if n <= 0 {
+			return 0
+		}
+		if n >= int64(probePauseMax/time.Second) {
+			return probePauseMax
+		}
 		return time.Duration(n) * time.Second
 	}
 	if t, err := http.ParseTime(v); err == nil && t.After(now) {
-		return t.Sub(now)
+		return min(t.Sub(now), probePauseMax)
 	}
 	return 0
 }
@@ -140,7 +150,7 @@ func (b *balancer) probe(t probeTarget, now time.Time) (quota, error) {
 		return quota{}, err
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return quota{}, usageLimited{retryAfter(resp.Header.Get("Retry-After"), now)}
+		return quota{}, usageLimited{retryAfter(resp.Header.Get("Retry-After"), b.now())} // from when the answer came
 	}
 	if resp.StatusCode != http.StatusOK {
 		return quota{}, fmt.Errorf("usage endpoint returned %d", resp.StatusCode)

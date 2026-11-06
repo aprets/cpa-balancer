@@ -20,7 +20,11 @@ func probeRig(t *testing.T) (*balancer, *usageStub) {
 
 func TestRetryAfter(t *testing.T) {
 	for v, want := range map[string]time.Duration{
-		"120": 2 * time.Minute, "": 0, "-5": 0, "soon": 0,
+		"120": 2 * time.Minute, "": 0, "-5": 0, "soon": 0, " 60 ": time.Minute,
+		// A day at most, and huge values can't overflow into a short pause.
+		"86400": 24 * time.Hour, "31536000": 24 * time.Hour, "9223372037": 24 * time.Hour,
+		"9223372036854775807": 24 * time.Hour, "99999999999999999999": 24 * time.Hour, "-99999999999999999999": 0,
+		t0.AddDate(1, 0, 0).UTC().Format(http.TimeFormat):   24 * time.Hour,
 		t0.Add(3 * time.Hour).UTC().Format(http.TimeFormat): 3 * time.Hour,
 		t0.Add(-time.Hour).UTC().Format(http.TimeFormat):    0,
 	} {
@@ -40,5 +44,24 @@ func TestProbeStalePausesForRetryAfter(t *testing.T) {
 		if p := b.accounts["cl"].probePause; !p.Equal(t0.Add(want)) {
 			t.Errorf("Retry-After %q: paused until %v, want %v", retry, p, t0.Add(want))
 		}
+	}
+}
+
+// A year's Retry-After pauses a day, and the pause runs from when the 429 came,
+// not from when the batch of probes began.
+func TestProbeStalePauseIsCappedAndCountsFromTheAnswer(t *testing.T) {
+	b, stub := probeRig(t)
+	stub.set(func(s *usageStub) { s.status, s.retryAfter = http.StatusTooManyRequests, "31536000" })
+	calls := 0
+	b.now = func() time.Time {
+		calls++
+		if calls == 1 {
+			return t0 // the batch starts
+		}
+		return t0.Add(10 * time.Minute) // earlier probes took ten minutes
+	}
+	b.probeStale()
+	if p, want := b.accounts["cl"].probePause, t0.Add(10*time.Minute+24*time.Hour); !p.Equal(want) {
+		t.Fatalf("paused until %v, want %v", p, want)
 	}
 }
