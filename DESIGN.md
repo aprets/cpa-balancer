@@ -222,7 +222,7 @@ model the account serves is benched. A CPA restart clears every hold unless
 | `probe_stale_minutes` | 60 | idle accounts get one direct usage pull per hour |
 | `recover` | true | a 429 hold outlives the quota it protected, see "Bringing back benched accounts" |
 | room to recover (constant) | 2% | keeps an account at the edge of its limit from coming back for one more 429 |
-| held probe gap (constant) | 30 min | the usage endpoint 429s when polled too often; a pause of an hour follows one |
+| held probe gap (constant) | 30 min | the usage endpoint 429s when polled too often; a pause of an hour, or its Retry-After if longer, follows one |
 
 ## How k and horizon were chosen (2026-09-15)
 

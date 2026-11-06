@@ -20,6 +20,7 @@ type usageStub struct {
 	weekly, fiveHour      float64
 	scoped                float64 // seven_day_fable utilisation, -1 for none
 	status                int     // usage endpoint status, 0 for 200
+	retryAfter            string  // Retry-After sent with status
 	probes                int     // usage endpoint hits
 	sent                  []string
 	weeklyReset, fiveSoon string
@@ -37,6 +38,9 @@ func newUsageStub(t *testing.T) (*usageStub, *httptest.Server) {
 		}
 		s.probes++
 		if s.status != 0 {
+			if s.retryAfter != "" {
+				w.Header().Set("Retry-After", s.retryAfter)
+			}
 			w.WriteHeader(s.status)
 			return
 		}
